@@ -152,8 +152,10 @@ def load_pddl_cylinder_obstacles(problem_path=PDDL_PROBLEM_PATH):
             "size": [radius, half_height],
             "rgba": PDDL_CYLINDER_COLORS.get(name, [0.9, 0.5, 0.1, 0.85]),
             "type": "cylinder",
-            "contype": 1,
-            "conaffinity": 1,
+            # MuJoCo cylinders have solid caps. Keep them visual-only here and
+            # let the MPC lateral-surface SDF provide the obstacle constraint.
+            "contype": 0,
+            "conaffinity": 0,
         })
     return obstacles
 

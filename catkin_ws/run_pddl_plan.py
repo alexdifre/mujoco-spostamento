@@ -79,6 +79,14 @@ def build_parabolic_waypoints(p0, p_goal, num_waypoints=80):
     return waypoints
 
 
+def build_linear_waypoints(p0, p_goal, num_waypoints=24):
+    p0 = np.asarray(p0, dtype=np.float64)
+    p_goal = np.asarray(p_goal, dtype=np.float64)
+    count = max(2, int(num_waypoints))
+    s_values = np.linspace(0.0, 1.0, count, dtype=np.float64)
+    return p0[None, :] + s_values[:, None] * (p_goal - p0)[None, :]
+
+
 def waypoint_arclengths(waypoints):
     waypoints = np.asarray(waypoints, dtype=np.float64)
     if len(waypoints) < 2:
@@ -214,7 +222,7 @@ def terminal_upright_error(robot):
     return float(np.linalg.norm(robot.ee_rot[:2, 2]))
 
 
-def make_solver(args, env, initial_pos, target_pos):
+def make_solver(args, env, initial_pos, target_pos, export_suffix=""):
     arm = ArmDynamics.from_robot(env.robot, dt=args.mpc_dt)
     initial_pos = np.asarray(initial_pos, dtype=np.float64)
     refs = np.repeat(initial_pos[None, :], args.horizon + 1, axis=0)
@@ -271,6 +279,8 @@ def make_solver(args, env, initial_pos, target_pos):
         delta_tau_max=[args.delta_tau_max] * 6,
     )
     acados_export_dir = args.acados_export_dir
+    if export_suffix:
+        acados_export_dir = f"{acados_export_dir}_{export_suffix}"
     if args.collision_constraints:
         acados_export_dir = f"{acados_export_dir}_collision"
     solver = AcadosRTISolver(
@@ -296,6 +306,7 @@ def run_with_env(args, env, viewer=None):
         target_clearance=args.target_clearance,
         rotate_layout=not args.raw_pddl_targets,
     )
+    approach_target = target.copy()
     initial_ee_pos = robot.ee_pos.copy()
     waypoint_path = build_parabolic_waypoints(
         initial_ee_pos,
@@ -331,6 +342,10 @@ def run_with_env(args, env, viewer=None):
     max_ineq_violation = 0.0
     previous_ee_err = float(np.linalg.norm(robot.ee_pos - target))
     target_settle_active = False
+    phase = "approach"
+    approach_hold_count = 0
+    bottom_hold_count = 0
+    return_hold_count = 0
     real_time_wall_start = time.perf_counter()
     real_time_sim_start = float(robot.data.time)
     print(f"target: {target_label} {np.round(target, 4).tolist()}")
@@ -349,17 +364,109 @@ def run_with_env(args, env, viewer=None):
 
         ee_err = float(np.linalg.norm(robot.ee_pos - target))
         upright_err = terminal_upright_error(robot)
+        active_reach_tol = (
+            args.vertical_reach_tol
+            if phase in {"descend", "ascend"}
+            else args.reach_tol
+        )
         if ee_err <= args.goal_hold_radius:
             target_settle_active = True
-        if ee_err <= args.reach_tol and upright_err <= args.upright_reach_tol:
-            print(
-                f"reached {target_label} err={ee_err:.4f} m, "
-                f"upright_err={upright_err:.4f}"
-            )
-            print(f"done in {step} sim steps")
-            return 0
+        if ee_err <= active_reach_tol and upright_err <= args.upright_reach_tol:
+            if phase == "approach":
+                if (not args.enable_cylinder_insertion
+                        or approach_hold_count >= args.approach_hold_steps):
+                    print(
+                        f"reached {target_label} err={ee_err:.4f} m, "
+                        f"upright_err={upright_err:.4f}"
+                    )
+                    if not args.enable_cylinder_insertion:
+                        print(f"done in {step} sim steps")
+                        return 0
+
+                    target = approach_target.copy()
+                    target[2] -= args.target_clearance + args.cylinder_entry_depth
+                    target_label = (
+                        f"inside {args.target_cylinder} "
+                        f"{args.cylinder_entry_depth:.3f} m below top"
+                    )
+                    waypoint_path = build_linear_waypoints(
+                        robot.ee_pos.copy(),
+                        target,
+                        num_waypoints=args.vertical_num_waypoints,
+                    )
+                    waypoint_s = waypoint_arclengths(waypoint_path)
+                    waypoint_index = 0
+                    closest_waypoint_index = 0
+                    distance_to_path = 0.0
+                    path_progress = 0.0
+                    arc_height = 0.0
+                    target_settle_active = False
+                    previous_ee_err = float(np.linalg.norm(robot.ee_pos - target))
+                    target_marker_position = target.copy()
+                    arm, problem, solver = make_solver(
+                        args,
+                        env,
+                        robot.ee_pos.copy(),
+                        target,
+                        export_suffix="vertical",
+                    )
+                    problem.set_previous_tau(current_tau)
+                    phase = "descend"
+                    print(
+                        f"starting vertical insertion target "
+                        f"{np.round(target, 4).tolist()}"
+                    )
+                    continue
+                approach_hold_count += 1
+                target_settle_active = True
+            elif phase == "descend":
+                if bottom_hold_count >= args.vertical_hold_steps:
+                    print(
+                        f"inserted {target_label} err={ee_err:.4f} m, "
+                        f"upright_err={upright_err:.4f}"
+                    )
+                    target = approach_target.copy()
+                    target_label = f"return above {args.target_cylinder}"
+                    waypoint_path = build_linear_waypoints(
+                        robot.ee_pos.copy(),
+                        target,
+                        num_waypoints=args.vertical_num_waypoints,
+                    )
+                    waypoint_s = waypoint_arclengths(waypoint_path)
+                    waypoint_index = 0
+                    closest_waypoint_index = 0
+                    distance_to_path = 0.0
+                    path_progress = 0.0
+                    arc_height = 0.0
+                    target_settle_active = False
+                    previous_ee_err = float(np.linalg.norm(robot.ee_pos - target))
+                    target_marker_position = target.copy()
+                    problem.set_previous_tau(current_tau)
+                    phase = "ascend"
+                    print(
+                        f"starting vertical return target "
+                        f"{np.round(target, 4).tolist()}"
+                    )
+                    continue
+                bottom_hold_count += 1
+                target_settle_active = True
+            elif phase == "ascend":
+                if return_hold_count >= args.vertical_return_hold_steps:
+                    print(
+                        f"returned {target_label} err={ee_err:.4f} m, "
+                        f"upright_err={upright_err:.4f}"
+                    )
+                    print(f"done in {step} sim steps")
+                    return 0
+                return_hold_count += 1
+                target_settle_active = True
 
         if step % mpc_every == 0:
+            active_ref_speed = (
+                args.vertical_ref_speed
+                if phase in {"descend", "ascend"}
+                else args.ref_speed
+            )
             problem.set_box_active_mask(
                 np.ones(args.horizon + 1, dtype=bool))
             problem.set_box_contact_allowed_mask(
@@ -373,7 +480,7 @@ def run_with_env(args, env, viewer=None):
                     path_progress,
                     args.horizon,
                     args.mpc_dt,
-                    args.ref_speed,
+                    active_ref_speed,
                     lookahead=args.reference_lookahead,
                     total_distance=waypoint_s[-1],
                 )
@@ -392,7 +499,7 @@ def run_with_env(args, env, viewer=None):
                         waypoint_path,
                         waypoint_s,
                         ref_distances,
-                        args.ref_speed,
+                        active_ref_speed,
                     )
                 problem.set_reference(refs, v_refs)
             max_delta_tau = args.tau_slew_rate * args.mpc_dt
@@ -450,7 +557,11 @@ def run_with_env(args, env, viewer=None):
         if post_step_err <= args.goal_hold_radius:
             progress_speed = 0.0
         else:
-            progress_speed = args.ref_speed
+            progress_speed = (
+                args.vertical_ref_speed
+                if phase in {"descend", "ascend"}
+                else args.ref_speed
+            )
         if post_step_err > previous_ee_err + args.progress_error_slack:
             progress_speed = 0.0
         previous_ee_err = post_step_err
@@ -544,6 +655,29 @@ def parse_args(argv=None):
     parser.add_argument("--mpc-dt", type=float, default=0.04)
     parser.add_argument("--ref-speed", type=float, default=0.18,
                         help="meters per second along the fixed Cartesian arc")
+    parser.add_argument("--enable-cylinder-insertion",
+                        dest="enable_cylinder_insertion",
+                        action="store_true",
+                        default=True,
+                        help="after reaching the first target, descend into the cylinder and return")
+    parser.add_argument("--no-cylinder-insertion",
+                        dest="enable_cylinder_insertion",
+                        action="store_false",
+                        help="stop after the first target as in the original PDDL playback")
+    parser.add_argument("--cylinder-entry-depth", type=float, default=0.04,
+                        help="meters below the target cylinder top for the vertical insertion")
+    parser.add_argument("--vertical-ref-speed", type=float, default=0.08,
+                        help="meters per second for the insertion and return MPC")
+    parser.add_argument("--vertical-reach-tol", type=float, default=0.015,
+                        help="position tolerance for insertion and return phases")
+    parser.add_argument("--approach-hold-steps", type=int, default=120,
+                        help="simulation steps to hold above the cylinder before descending")
+    parser.add_argument("--vertical-hold-steps", type=int, default=180,
+                        help="simulation steps to hold inside the cylinder before returning")
+    parser.add_argument("--vertical-return-hold-steps", type=int, default=120,
+                        help="simulation steps to hold after returning above the cylinder")
+    parser.add_argument("--vertical-num-waypoints", type=int, default=24,
+                        help="linear waypoint count for vertical insertion and return")
     parser.add_argument("--num-waypoints", type=int, default=80)
     parser.add_argument("--waypoint-tracking-tol", type=float, default=0.025)
     parser.add_argument("--max-path-lead", type=float, default=0.10,
