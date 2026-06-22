@@ -7,7 +7,7 @@ forward kinematics, and Jacobians at the current warm-start trajectory.
 This module keeps that modeling layer and uses acados to solve the local
 linear-quadratic RTI subproblem.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 import sys
@@ -35,6 +35,55 @@ ACADOS_BIN_DIR = os.path.join(ACADOS_SOURCE_DIR, "bin")
 MINGW_BIN_DIR = r"C:\conda-forge\envs\mlc-stack\Library\mingw-w64\bin"
 
 
+def _repo_root():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _default_code_export_directory():
+    return os.path.join(_repo_root(), "acados_generated", "ur10e_rti")
+
+
+def _windows_short_path(path):
+    if os.name != "nt":
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return path
+
+    GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+    GetShortPathNameW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    GetShortPathNameW.restype = wintypes.DWORD
+
+    length = GetShortPathNameW(path, None, 0)
+    if length == 0:
+        return path
+    buffer = ctypes.create_unicode_buffer(length)
+    result = GetShortPathNameW(path, buffer, length)
+    if result == 0 or result > length:
+        return path
+    return buffer.value
+
+
+def _windows_path_without_spaces(path):
+    if os.name != "nt" or " " not in path:
+        return path
+    root = _repo_root()
+    try:
+        rel_path = os.path.relpath(path, root)
+    except ValueError:
+        return _windows_short_path(path)
+    if rel_path.startswith(".."):
+        return _windows_short_path(path)
+    short_root = _windows_short_path(root)
+    return os.path.join(short_root, rel_path)
+
+
 def configure_acados_environment():
     if os.path.isdir(ACADOS_TEMPLATE_DIR) and ACADOS_TEMPLATE_DIR not in sys.path:
         sys.path.insert(0, ACADOS_TEMPLATE_DIR)
@@ -54,10 +103,7 @@ def configure_acados_environment():
 
 @dataclass
 class AcadosRTIConfig:
-    code_export_directory: str = (
-        r"C:\Users\ALESSA~1\OneDrive\Desktop"
-        r"\mujoco-robot-simulators-main\acados_generated\ur10e_rti"
-    )
+    code_export_directory: str = field(default_factory=_default_code_export_directory)
     qp_solver: str = "PARTIAL_CONDENSING_HPIPM"
     qp_solver_iter_max: int = 200
     nlp_solver_type: str = "SQP_RTI"
@@ -65,6 +111,10 @@ class AcadosRTIConfig:
     regularization: float = 1e-8
     constraint_slack_linear: float = 1e2
     constraint_slack_quadratic: float = 1e4
+    nlp_solver_warm_start_first_qp: bool = True
+    nlp_solver_warm_start_first_qp_from_nlp: bool = True
+    fast_control: bool = False
+    build_solver: bool = True
     verbose: bool = False
 
 
@@ -73,6 +123,9 @@ class AcadosRTISolver:
         configure_acados_environment()
         self.problem = problem
         self.config = config or AcadosRTIConfig()
+        export_dir = os.path.abspath(self.config.code_export_directory)
+        os.makedirs(export_dir, exist_ok=True)
+        self.config.code_export_directory = _windows_path_without_spaces(export_dir)
         self.debug = bool(debug)
         self.previous_trajectory = None
         self.mpc_step = 0
@@ -149,6 +202,10 @@ class AcadosRTISolver:
             "param_size": self._param_size,
             "qp_solver": self.config.qp_solver,
             "nlp_solver_type": self.config.nlp_solver_type,
+            "nlp_solver_warm_start_first_qp":
+                self.config.nlp_solver_warm_start_first_qp,
+            "nlp_solver_warm_start_first_qp_from_nlp":
+                self.config.nlp_solver_warm_start_first_qp_from_nlp,
             "constraint_slack_linear": self.config.constraint_slack_linear,
             "constraint_slack_quadratic": self.config.constraint_slack_quadratic,
         }
@@ -156,6 +213,7 @@ class AcadosRTISolver:
             with open(signature_file, "r", encoding="utf-8") as f:
                 old_signature = json.load(f)
             if old_signature == signature:
+                self._refresh_existing_json_paths(json_file)
                 self.solver = AcadosOcpSolver(
                     None,
                     json_file=json_file,
@@ -164,6 +222,14 @@ class AcadosRTISolver:
                     verbose=self.config.verbose,
                 )
                 return
+
+        if not self.config.build_solver:
+            raise RuntimeError(
+                "precompiled acados solver is missing or stale: "
+                f"{self.config.code_export_directory}. "
+                "Run catkin_ws/prebuild_acados_solvers.py before using "
+                "runtime-only mode."
+            )
 
         z = ca.SX.sym("z", self.nz)
         du = ca.SX.sym("du", self.nu)
@@ -240,6 +306,16 @@ class AcadosRTISolver:
         ocp.solver_options.qp_solver_iter_max = self.config.qp_solver_iter_max
         ocp.solver_options.nlp_solver_type = self.config.nlp_solver_type
         ocp.solver_options.hessian_approx = self.config.hessian_approx
+        self._set_optional_solver_option(
+            ocp.solver_options,
+            "nlp_solver_warm_start_first_qp",
+            bool(self.config.nlp_solver_warm_start_first_qp),
+        )
+        self._set_optional_solver_option(
+            ocp.solver_options,
+            "nlp_solver_warm_start_first_qp_from_nlp",
+            bool(self.config.nlp_solver_warm_start_first_qp_from_nlp),
+        )
         ocp.solver_options.tf = float(self.N)
         ocp.solver_options.print_level = 1 if self.config.verbose else 0
         ocp.code_export_directory = self.config.code_export_directory
@@ -249,7 +325,7 @@ class AcadosRTISolver:
         cmake_builder.additional_cmake_options = ""
         cmake_builder.build_dir = os.path.join(
             self.config.code_export_directory,
-            "build",
+            "build_active",
         )
 
         self.solver = AcadosOcpSolver(
@@ -261,6 +337,35 @@ class AcadosRTISolver:
         os.makedirs(self.config.code_export_directory, exist_ok=True)
         with open(signature_file, "w", encoding="utf-8") as f:
             json.dump(signature, f, indent=2)
+
+    @staticmethod
+    def _set_optional_solver_option(options, name, value):
+        try:
+            setattr(options, name, value)
+        except Exception:
+            pass
+
+    def _refresh_existing_json_paths(self, json_file):
+        """Keep generated acados JSON loadable after moving the repository."""
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        changed = False
+        code_gen_opts = data.get("code_gen_opts", {})
+        if code_gen_opts.get("code_export_directory") != self.config.code_export_directory:
+            code_gen_opts["code_export_directory"] = self.config.code_export_directory
+            data["code_gen_opts"] = code_gen_opts
+            changed = True
+        if code_gen_opts.get("json_file") != json_file:
+            code_gen_opts["json_file"] = json_file
+            data["code_gen_opts"] = code_gen_opts
+            changed = True
+        if changed:
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
 
     def _warm_start(self, measured_state):
         if self.previous_trajectory is None:
@@ -366,7 +471,9 @@ class AcadosRTISolver:
             self.solver.constraints_set(k, "lg", -values[rows])
             self.solver.constraints_set(k, "ug", 1e9 * np.ones(self.ng))
 
-    def _initialize_iterate(self):
+    def _initialize_iterate(self, reset=False):
+        if not reset:
+            return
         for k in range(self.N + 1):
             self.solver.set(k, "x", np.zeros(self.nz))
         for k in range(self.N):
@@ -408,7 +515,7 @@ class AcadosRTISolver:
         )
         self._set_bounds(delta_lower, delta_upper)
         self._set_linearized_inequalities(ineq_before, jac_ineq)
-        self._initialize_iterate()
+        self._initialize_iterate(reset=self.previous_trajectory is None)
 
         status = int(self.solver.solve())
         success = status == 0
@@ -420,12 +527,24 @@ class AcadosRTISolver:
         traj_new = Trajectory(x_new, u_new)
         applied = self.problem.arm._clip_tau(traj_new.u[0])
 
-        y_new = traj_new.stack()
-        cost_before = float(self.problem.cost(y_bar))
-        cost_after = float(self.problem.cost(y_new))
-        eq_before = self.problem.equality_constraints(y_bar)
-        eq_after = self.problem.equality_constraints(y_new)
-        ineq_after = self.problem.inequality_constraints(y_new)
+        cost_before = 0.5 * float(residuals @ residuals)
+        eq_before_norm = float("nan")
+        ineq_before_violation = float(
+            np.min(np.minimum(ineq_before, 0.0)) if ineq_before.size else 0.0)
+        if self.config.fast_control:
+            cost_after = float("nan")
+            eq_after_norm = float("nan")
+            ineq_after_violation = ineq_before_violation
+        else:
+            y_new = traj_new.stack()
+            cost_after = float(self.problem.cost(y_new))
+            eq_before = self.problem.equality_constraints(y_bar)
+            eq_after = self.problem.equality_constraints(y_new)
+            ineq_after = self.problem.inequality_constraints(y_new)
+            eq_before_norm = float(np.linalg.norm(eq_before))
+            eq_after_norm = float(np.linalg.norm(eq_after))
+            ineq_after_violation = float(
+                np.min(np.minimum(ineq_after, 0.0)) if ineq_after.size else 0.0)
 
         if success:
             self.previous_trajectory = traj_new
@@ -436,18 +555,16 @@ class AcadosRTISolver:
         diag = RTIDiagnostics(
             mpc_step=self.mpc_step,
             cost_before=cost_before,
-            equality_residual_norm_before=float(np.linalg.norm(eq_before)),
-            inequality_violation_before=float(
-                np.min(np.minimum(ineq_before, 0.0)) if ineq_before.size else 0.0),
+            equality_residual_norm_before=eq_before_norm,
+            inequality_violation_before=ineq_before_violation,
             qp_status=f"acados_status_{status}",
             qp_iterations=0,
             qp_objective=0.0,
             delta_norm=float(np.linalg.norm(du) + np.linalg.norm(dx)),
             alpha=1.0,
             cost_after=cost_after,
-            equality_residual_norm_after=float(np.linalg.norm(eq_after)),
-            inequality_violation_after=float(
-                np.min(np.minimum(ineq_after, 0.0)) if ineq_after.size else 0.0),
+            equality_residual_norm_after=eq_after_norm,
+            inequality_violation_after=ineq_after_violation,
             applied_control=applied.copy(),
             sqp_steps=1,
             qp_solve_attempts=1,

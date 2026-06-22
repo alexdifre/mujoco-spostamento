@@ -173,6 +173,8 @@ def make_solver(args, env):
             qp_solver_iter_max=args.acados_qp_solver_iter_max,
             nlp_solver_type=args.acados_nlp_solver_type,
             regularization=args.regularization,
+            fast_control=args.fast_control,
+            build_solver=not args.acados_runtime_only,
             verbose=args.acados_verbose,
         ),
         debug=args.debug,
@@ -500,6 +502,10 @@ def parse_args():
     parser.add_argument("--acados-nlp-solver-type", default="SQP_RTI")
     parser.add_argument("--regularization", type=float, default=1e-8)
     parser.add_argument("--acados-verbose", action="store_true")
+    parser.add_argument("--fast-control", action="store_true",
+                        help="skip expensive post-solve diagnostics in the realtime MPC loop")
+    parser.add_argument("--acados-runtime-only", action="store_true",
+                        help="load a prebuilt acados solver and fail instead of generating/building at runtime")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--out-dir", type=Path, default=Path("experiments") / "ur10e_acados_grasp")
     parser.add_argument("--viewer", action="store_true")

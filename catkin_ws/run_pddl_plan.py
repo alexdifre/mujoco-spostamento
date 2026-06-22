@@ -33,6 +33,25 @@ TRAJ_MAX_PTS = 800
 TRAJ_SAMPLE_DT = 0.01
 
 
+def default_acados_export_dir(name="ur10e_above"):
+    return os.path.abspath(os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "acados_generated",
+        name,
+    ))
+
+
+def resolve_acados_export_dir(path):
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+    return os.path.abspath(os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        path,
+    ))
+
+
 def build_single_target(target_cylinder, target_clearance=0.06,
                         rotate_layout=True):
     if target_cylinder not in PDDL_CYLINDER_RADII:
@@ -222,6 +241,16 @@ def terminal_upright_error(robot):
     return float(np.linalg.norm(robot.ee_rot[:2, 2]))
 
 
+def phase_acados_export_dir(args, export_suffix=""):
+    if export_suffix == "vertical":
+        directory = args.acados_insert_export_dir
+    else:
+        directory = args.acados_above_export_dir
+    if not args.collision_constraints:
+        directory = f"{directory}_free"
+    return resolve_acados_export_dir(directory)
+
+
 def make_solver(args, env, initial_pos, target_pos, export_suffix=""):
     arm = ArmDynamics.from_robot(env.robot, dt=args.mpc_dt)
     initial_pos = np.asarray(initial_pos, dtype=np.float64)
@@ -278,11 +307,7 @@ def make_solver(args, env, initial_pos, target_pos, export_suffix=""):
         delta_dq_max=[args.delta_dq_max] * 6,
         delta_tau_max=[args.delta_tau_max] * 6,
     )
-    acados_export_dir = args.acados_export_dir
-    if export_suffix:
-        acados_export_dir = f"{acados_export_dir}_{export_suffix}"
-    if args.collision_constraints:
-        acados_export_dir = f"{acados_export_dir}_collision"
+    acados_export_dir = phase_acados_export_dir(args, export_suffix)
     solver = AcadosRTISolver(
         problem,
         config=AcadosRTIConfig(
@@ -291,6 +316,8 @@ def make_solver(args, env, initial_pos, target_pos, export_suffix=""):
             qp_solver_iter_max=args.acados_qp_solver_iter_max,
             nlp_solver_type=args.acados_nlp_solver_type,
             regularization=args.regularization,
+            fast_control=args.fast_control,
+            build_solver=not args.acados_runtime_only,
             verbose=args.acados_verbose,
         ),
         debug=args.debug,
@@ -726,11 +753,14 @@ def parse_args(argv=None):
     parser.add_argument("--regularization", type=float, default=1e-5)
     parser.add_argument(
         "--acados-export-dir",
-        default=(
-            r"C:\Users\ALESSA~1\OneDrive\Desktop"
-            r"\mujoco-robot-simulators-main\acados_generated\ur10e_rti"
-        ),
-                        help="directory for generated acados solver code")
+        default=default_acados_export_dir(),
+                        help="deprecated alias for --acados-above-export-dir")
+    parser.add_argument("--acados-above-export-dir",
+                        default=default_acados_export_dir("ur10e_above"),
+                        help="prebuilt acados solver directory for the above/approach phase")
+    parser.add_argument("--acados-insert-export-dir",
+                        default=default_acados_export_dir("ur10e_insert"),
+                        help="prebuilt acados solver directory for the vertical insert/return phase")
     parser.add_argument("--acados-qp-solver", default="PARTIAL_CONDENSING_HPIPM",
                         help="acados QP solver")
     parser.add_argument("--acados-qp-solver-iter-max", type=int, default=200,
@@ -740,6 +770,10 @@ def parse_args(argv=None):
                         help="acados NLP solver type")
     parser.add_argument("--acados-verbose", action="store_true",
                         help="print acados generation and solver output")
+    parser.add_argument("--fast-control", action="store_true",
+                        help="skip expensive post-solve diagnostics in the realtime MPC loop")
+    parser.add_argument("--acados-runtime-only", action="store_true",
+                        help="load prebuilt acados solvers and fail instead of generating/building at runtime")
     parser.add_argument("--delta-q-max", type=float, default=0.12)
     parser.add_argument("--delta-dq-max", type=float, default=0.45)
     parser.add_argument("--delta-tau-max", type=float, default=25.0)
@@ -765,7 +799,10 @@ def parse_args(argv=None):
     parser.add_argument("--tcp-marker-radius", type=float, default=0.004,
                         help="radius of the cyan marker showing robot.ee_pos")
     parser.add_argument("--debug", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.acados_export_dir != default_acados_export_dir():
+        args.acados_above_export_dir = args.acados_export_dir
+    return args
 
 
 if __name__ == "__main__":
