@@ -174,7 +174,7 @@ def make_solver(args, env):
             nlp_solver_type=args.acados_nlp_solver_type,
             regularization=args.regularization,
             fast_control=args.fast_control,
-            build_solver=not args.acados_runtime_only,
+            build_solver=args.build_acados,
             verbose=args.acados_verbose,
         ),
         debug=args.debug,
@@ -505,7 +505,9 @@ def parse_args():
     parser.add_argument("--fast-control", action="store_true",
                         help="skip expensive post-solve diagnostics in the realtime MPC loop")
     parser.add_argument("--acados-runtime-only", action="store_true",
-                        help="load a prebuilt acados solver and fail instead of generating/building at runtime")
+                        help="deprecated no-op; runtime is load-only unless --build-acados is set")
+    parser.add_argument("--build-acados", action="store_true",
+                        help="allow acados code generation and CMake build in this process")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--out-dir", type=Path, default=Path("experiments") / "ur10e_acados_grasp")
     parser.add_argument("--viewer", action="store_true")

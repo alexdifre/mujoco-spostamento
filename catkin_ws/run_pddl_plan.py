@@ -317,7 +317,7 @@ def make_solver(args, env, initial_pos, target_pos, export_suffix=""):
             nlp_solver_type=args.acados_nlp_solver_type,
             regularization=args.regularization,
             fast_control=args.fast_control,
-            build_solver=not args.acados_runtime_only,
+            build_solver=args.build_acados,
             verbose=args.acados_verbose,
         ),
         debug=args.debug,
@@ -773,7 +773,9 @@ def parse_args(argv=None):
     parser.add_argument("--fast-control", action="store_true",
                         help="skip expensive post-solve diagnostics in the realtime MPC loop")
     parser.add_argument("--acados-runtime-only", action="store_true",
-                        help="load prebuilt acados solvers and fail instead of generating/building at runtime")
+                        help="deprecated no-op; runtime is load-only unless --build-acados is set")
+    parser.add_argument("--build-acados", action="store_true",
+                        help="allow acados code generation and CMake build in this process")
     parser.add_argument("--delta-q-max", type=float, default=0.12)
     parser.add_argument("--delta-dq-max", type=float, default=0.45)
     parser.add_argument("--delta-tau-max", type=float, default=25.0)

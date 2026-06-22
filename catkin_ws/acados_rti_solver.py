@@ -114,7 +114,7 @@ class AcadosRTIConfig:
     nlp_solver_warm_start_first_qp: bool = True
     nlp_solver_warm_start_first_qp_from_nlp: bool = True
     fast_control: bool = False
-    build_solver: bool = True
+    build_solver: bool = False
     verbose: bool = False
 
 
@@ -227,8 +227,8 @@ class AcadosRTISolver:
             raise RuntimeError(
                 "precompiled acados solver is missing or stale: "
                 f"{self.config.code_export_directory}. "
-                "Run catkin_ws/prebuild_acados_solvers.py before using "
-                "runtime-only mode."
+                "Run catkin_ws/prebuild_acados_solvers.py offline first, "
+                "or pass --build-acados explicitly."
             )
 
         z = ca.SX.sym("z", self.nz)

@@ -59,6 +59,7 @@ def build_default_pddl_set(args):
         args.acados_nlp_solver_type,
         "--regularization",
         str(args.regularization),
+        "--build-acados",
     ]
 
     print(f"building solver A: above/free-space -> {args.acados_above_export_dir}_free")
