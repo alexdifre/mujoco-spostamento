@@ -11,3 +11,13 @@ MUJOCO_LOG.TXT
 acados_generated/
 experiments/
 catkin_ws/experiments/
+*.log
+*.csv
+*.npy
+*.npz
+*.pkl
+*.pickle
+*_metrics_*.csv
+*_report_*.json
+*_report_*.md
+MUJOCO_LOG.TXT
