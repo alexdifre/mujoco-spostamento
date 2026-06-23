@@ -38,6 +38,13 @@ class CollisionSphere:
                            np.asarray(self.local_pos, dtype=np.float64))
 
 
+@dataclass(frozen=True)
+class StaticObstacleConstraint:
+    sdf: object
+    safety_margin: float
+    name: str = ""
+
+
 class FiniteCylinderSDF:
     """Signed distance to the lateral surface of a finite open cylinder.
 
@@ -130,11 +137,14 @@ class CollisionSphereModel:
             dtype=np.int32,
         )
         self.spheres = list(spheres)
-        self.static_obstacles = list(static_obstacles or [])
-        self.box_sdf = box_sdf
         self.d_ground = float(d_ground)
         self.d_safe = float(d_safe)
         self.d_box = float(d_box)
+        self.static_obstacles = [
+            self._normalize_static_obstacle(obstacle)
+            for obstacle in (static_obstacles or [])
+        ]
+        self.box_sdf = box_sdf
 
         self.body_ids = []
         for sphere in self.spheres:
@@ -143,6 +153,14 @@ class CollisionSphereModel:
             if body_id < 0:
                 raise ValueError(f"unknown body {sphere.body_name!r}")
             self.body_ids.append(body_id)
+
+    def _normalize_static_obstacle(self, obstacle):
+        if isinstance(obstacle, StaticObstacleConstraint):
+            return obstacle
+        return StaticObstacleConstraint(
+            sdf=obstacle,
+            safety_margin=self.d_safe,
+        )
 
     def _with_q(self, q, callback):
         qpos = self.data.qpos.copy()
@@ -197,8 +215,12 @@ class CollisionSphereModel:
             if not sphere.box_contact_geometry:
                 values.append(center[2] - sphere.radius - self.d_ground)
 
-            for obstacle_sdf in self.static_obstacles:
-                values.append(obstacle_sdf(center) - sphere.radius - self.d_safe)
+            for obstacle in self.static_obstacles:
+                values.append(
+                    obstacle.sdf(center)
+                    - sphere.radius
+                    - obstacle.safety_margin
+                )
 
             skip_box = sphere.box_contact_geometry and allow_box_contact_geometry
             if self.box_sdf is not None and include_box and not skip_box:
@@ -218,9 +240,9 @@ class CollisionSphereModel:
                 values.append(center[2] - sphere.radius - self.d_ground)
                 jac_rows.append(center_jac[2])
 
-            for obstacle_sdf in self.static_obstacles:
-                dist, grad = _sdf_value_and_gradient(obstacle_sdf, center)
-                values.append(dist - sphere.radius - self.d_safe)
+            for obstacle in self.static_obstacles:
+                dist, grad = _sdf_value_and_gradient(obstacle.sdf, center)
+                values.append(dist - sphere.radius - obstacle.safety_margin)
                 jac_rows.append(grad @ center_jac)
 
             skip_box = sphere.box_contact_geometry and allow_box_contact_geometry
@@ -282,40 +304,31 @@ def default_ur10e_collision_spheres():
 
         CollisionSphere("forearm_link", [-0.10, 0.0, 0.03], 0.080,
                         "forearm_0"),
-        CollisionSphere("forearm_link", [-0.27, 0.0, 0.08], 0.080,
-                        "forearm_1"),
-        CollisionSphere("forearm_link", [-0.44, 0.0, 0.13], 0.080,
-                        "forearm_2"),
-        CollisionSphere("forearm_link", [-0.56, 0.0, 0.17], 0.075,
-                        "forearm_3"),
-
-        CollisionSphere("wrist_1_link", [0.0, -0.06, 0.0], 0.075,
-                        "wrist_1"),
-        CollisionSphere("wrist_2_link", [0.0, 0.05, 0.0], 0.070,
-                        "wrist_2"),
-        CollisionSphere("wrist_3_link", [0.0, 0.0, 0.05], 0.065,
-                        "wrist_3_0"),
-        CollisionSphere("wrist_3_link", [0.0, 0.0, 0.14], 0.060,
-                        "wrist_3_1"),
-
-        CollisionSphere("ee_tcp", [0.0, 0.0, 0.0], 0.055,
-                        "tool_tcp", box_contact_geometry=True),
-        CollisionSphere("jaws_link", [0.0, 0.0, 0.04], 0.070,
-                        "jaws", box_contact_geometry=True),
     ]
     return specs
 
 
-def obstacle_sdfs_from_environment(env, excluded_obstacle_names=None):
+def obstacle_sdfs_from_environment(env, target_obstacle_name=None,
+                                   target_d_safe_factor=0.5,
+                                   d_safe=0.04,
+                                   excluded_obstacle_names=None):
     excluded = set(excluded_obstacle_names or [])
     sdfs = []
     for spec in env._obstacle_defs:
-        if spec.get("name") in excluded:
+        name = spec.get("name", "")
+        if name in excluded:
             continue
         if spec.get("type") != "cylinder":
             continue
         radius, half_height = spec["size"]
-        sdfs.append(FiniteCylinderSDF(spec["pos"], radius, half_height))
+        safety_margin = float(d_safe)
+        if name == target_obstacle_name:
+            safety_margin *= float(target_d_safe_factor)
+        sdfs.append(StaticObstacleConstraint(
+            sdf=FiniteCylinderSDF(spec["pos"], radius, half_height),
+            safety_margin=safety_margin,
+            name=name,
+        ))
     return sdfs
 
 
@@ -330,6 +343,8 @@ def make_default_ur10e_collision_model(env, arm,
                                        d_ground=0.02,
                                        d_safe=0.04,
                                        d_box=0.03,
+                                       target_obstacle_name=None,
+                                       target_d_safe_factor=0.5,
                                        excluded_obstacle_names=None):
     return CollisionSphereModel(
         arm.model,
@@ -338,6 +353,9 @@ def make_default_ur10e_collision_model(env, arm,
         default_ur10e_collision_spheres(),
         static_obstacles=obstacle_sdfs_from_environment(
             env,
+            target_obstacle_name=target_obstacle_name,
+            target_d_safe_factor=target_d_safe_factor,
+            d_safe=d_safe,
             excluded_obstacle_names=excluded_obstacle_names,
         ),
         box_sdf=(box_sdf if include_box else None),

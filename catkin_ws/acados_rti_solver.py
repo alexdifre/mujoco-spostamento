@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import json
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -32,6 +33,7 @@ ACADOS_TEMPLATE_DIR = os.path.join(
     "acados_template",
 )
 ACADOS_BIN_DIR = os.path.join(ACADOS_SOURCE_DIR, "bin")
+ACADOS_LIB_DIR = os.path.join(ACADOS_SOURCE_DIR, "lib")
 MINGW_BIN_DIR = r"C:\conda-forge\envs\mlc-stack\Library\mingw-w64\bin"
 
 
@@ -95,6 +97,13 @@ def configure_acados_environment():
         add_dll_directory = getattr(os, "add_dll_directory", None)
         if add_dll_directory is not None:
             add_dll_directory(ACADOS_BIN_DIR)
+    if os.path.isdir(ACADOS_LIB_DIR):
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        if ACADOS_LIB_DIR not in path_entries:
+            os.environ["PATH"] = ACADOS_LIB_DIR + os.pathsep + os.environ.get("PATH", "")
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            add_dll_directory(ACADOS_LIB_DIR)
     if os.path.isdir(MINGW_BIN_DIR):
         path_entries = os.environ.get("PATH", "").split(os.pathsep)
         if MINGW_BIN_DIR not in path_entries:
@@ -104,13 +113,11 @@ def configure_acados_environment():
 @dataclass
 class AcadosRTIConfig:
     code_export_directory: str = field(default_factory=_default_code_export_directory)
-    qp_solver: str = "PARTIAL_CONDENSING_HPIPM"
+    qp_solver: str = "FULL_CONDENSING_DAQP"
     qp_solver_iter_max: int = 200
     nlp_solver_type: str = "SQP_RTI"
     hessian_approx: str = "EXACT"
     regularization: float = 1e-8
-    constraint_slack_linear: float = 1e2
-    constraint_slack_quadratic: float = 1e4
     nlp_solver_warm_start_first_qp: bool = True
     nlp_solver_warm_start_first_qp_from_nlp: bool = True
     fast_control: bool = False
@@ -192,6 +199,7 @@ class AcadosRTISolver:
             self.config.code_export_directory,
             "solver_signature.json",
         )
+        warm_start_from_nlp = self._supports_warm_start_from_nlp()
         signature = {
             "N": self.N,
             "nx": self.nx,
@@ -204,10 +212,8 @@ class AcadosRTISolver:
             "nlp_solver_type": self.config.nlp_solver_type,
             "nlp_solver_warm_start_first_qp":
                 self.config.nlp_solver_warm_start_first_qp,
-            "nlp_solver_warm_start_first_qp_from_nlp":
-                self.config.nlp_solver_warm_start_first_qp_from_nlp,
-            "constraint_slack_linear": self.config.constraint_slack_linear,
-            "constraint_slack_quadratic": self.config.constraint_slack_quadratic,
+            "nlp_solver_warm_start_first_qp_from_nlp": warm_start_from_nlp,
+            "constraint_formulation": "hard",
         }
         if os.path.exists(json_file) and os.path.exists(dll_file) and os.path.exists(signature_file):
             with open(signature_file, "r", encoding="utf-8") as f:
@@ -290,16 +296,6 @@ class AcadosRTISolver:
             ocp.constraints.C_e = np.zeros((self.ng, self.nz))
             ocp.constraints.lg_e = -1e9 * np.ones(self.ng)
             ocp.constraints.ug_e = 1e9 * np.ones(self.ng)
-            ocp.constraints.idxsg = np.arange(self.ng)
-            ocp.constraints.idxsg_e = np.arange(self.ng)
-            ocp.cost.zl = self.config.constraint_slack_linear * np.ones(self.ng)
-            ocp.cost.zu = np.zeros(self.ng)
-            ocp.cost.Zl = self.config.constraint_slack_quadratic * np.ones(self.ng)
-            ocp.cost.Zu = np.zeros(self.ng)
-            ocp.cost.zl_e = self.config.constraint_slack_linear * np.ones(self.ng)
-            ocp.cost.zu_e = np.zeros(self.ng)
-            ocp.cost.Zl_e = self.config.constraint_slack_quadratic * np.ones(self.ng)
-            ocp.cost.Zu_e = np.zeros(self.ng)
 
         ocp.solver_options.integrator_type = "DISCRETE"
         ocp.solver_options.qp_solver = self.config.qp_solver
@@ -314,7 +310,7 @@ class AcadosRTISolver:
         self._set_optional_solver_option(
             ocp.solver_options,
             "nlp_solver_warm_start_first_qp_from_nlp",
-            bool(self.config.nlp_solver_warm_start_first_qp_from_nlp),
+            bool(warm_start_from_nlp),
         )
         ocp.solver_options.tf = float(self.N)
         ocp.solver_options.print_level = 1 if self.config.verbose else 0
@@ -344,6 +340,12 @@ class AcadosRTISolver:
             setattr(options, name, value)
         except Exception:
             pass
+
+    def _supports_warm_start_from_nlp(self):
+        return (
+            bool(self.config.nlp_solver_warm_start_first_qp_from_nlp)
+            and self.config.qp_solver == "PARTIAL_CONDENSING_HPIPM"
+        )
 
     def _refresh_existing_json_paths(self, json_file):
         """Keep generated acados JSON loadable after moving the repository."""
@@ -480,20 +482,70 @@ class AcadosRTISolver:
             self.solver.set(k, "u", np.zeros(self.nu))
 
     def step(self, measured_state):
+        profile = {}
+        total_start = time.perf_counter()
+
+        def elapsed_ms(start):
+            return 1000.0 * (time.perf_counter() - start)
+
+        t0 = time.perf_counter()
         self.problem.prepare_step(measured_state)
+        profile["prepare_step_ms"] = elapsed_ms(t0)
+
+        t0 = time.perf_counter()
+        had_previous = self.previous_trajectory is not None
         warm = self._warm_start(measured_state)
+        warm_ms = elapsed_ms(t0)
+        profile["rollout_or_warmstart_ms"] = warm_ms
+        profile["trajectory_shift_ms"] = warm_ms if had_previous else 0.0
+
+        t0 = time.perf_counter()
         y_bar = warm.stack()
-        residuals, jacobian = self.problem.residuals_with_jacobian(y_bar)
-        ineq_before, jac_ineq = self.problem.inequality_constraints_with_jacobian(y_bar)
+        profile["trajectory_stack_ms"] = elapsed_ms(t0)
+
+        t0 = time.perf_counter()
+        kinematics_cache = self.problem.kinematics_cache_for_trajectory(warm)
+        profile["kinematics_cache_ms"] = elapsed_ms(t0)
+
+        t0 = time.perf_counter()
+        dynamics_cache = self.problem.dynamics_cache_for_trajectory(warm)
+        profile["dynamics_linearization_ms"] = elapsed_ms(t0)
+
+        t0 = time.perf_counter()
+        residuals, jacobian = self.problem.residuals_with_jacobian(
+            y_bar,
+            kinematics_cache=kinematics_cache,
+        )
+        profile["cost_residual_jacobian_ms"] = elapsed_ms(t0)
+
+        profile["inequality_value_ms"] = 0.0
+        t0 = time.perf_counter()
+        ineq_before, jac_ineq = self.problem.inequality_constraints_with_jacobian(
+            y_bar,
+            kinematics_cache=kinematics_cache,
+        )
+        profile["inequality_jacobian_ms"] = elapsed_ms(t0)
+
+        t0 = time.perf_counter()
         delta_lower, delta_upper = self.problem.delta_bounds(y_bar)
+        profile["bounds_delta_ms"] = elapsed_ms(t0)
 
+        t0 = time.perf_counter()
         terminal_H, terminal_g = self._terminal_cost_quadratic(residuals, jacobian)
+        profile["terminal_cost_ms"] = elapsed_ms(t0)
 
+        cost_set_ms = 0.0
+        dynamics_set_ms = 0.0
         for k in range(self.N):
-            A, B = self.problem._local_dynamics_linearization(warm.x[k], warm.u[k])
-            f_next = self.problem.arm.step_dynamics(warm.x[k], warm.u[k])
-            c = f_next - warm.x[k + 1]
+            A = dynamics_cache.A[k]
+            B = dynamics_cache.B[k]
+            c = dynamics_cache.x_next[k] - warm.x[k + 1]
+
+            t_cost = time.perf_counter()
             H, g = self._stage_cost_quadratic(residuals, jacobian, k)
+            cost_set_ms += elapsed_ms(t_cost)
+
+            t_dyn = time.perf_counter()
             self.solver.set(
                 k,
                 "p",
@@ -507,26 +559,45 @@ class AcadosRTISolver:
                     g_e=terminal_g,
                 ),
             )
+            dynamics_set_ms += elapsed_ms(t_dyn)
 
+        t_dyn = time.perf_counter()
         self.solver.set(
             self.N,
             "p",
             self._pack_params(H_e=terminal_H, g_e=terminal_g),
         )
-        self._set_bounds(delta_lower, delta_upper)
-        self._set_linearized_inequalities(ineq_before, jac_ineq)
-        self._initialize_iterate(reset=self.previous_trajectory is None)
+        dynamics_set_ms += elapsed_ms(t_dyn)
+        profile["acados_set_cost_ms"] = cost_set_ms
+        profile["acados_set_dynamics_ms"] = dynamics_set_ms
 
+        t0 = time.perf_counter()
+        self._set_bounds(delta_lower, delta_upper)
+        profile["acados_set_bounds_ms"] = elapsed_ms(t0)
+
+        t0 = time.perf_counter()
+        self._set_linearized_inequalities(ineq_before, jac_ineq)
+        profile["acados_set_constraints_ms"] = elapsed_ms(t0)
+
+        t0 = time.perf_counter()
+        self._initialize_iterate(reset=self.previous_trajectory is None)
+        profile["acados_initialize_iterate_ms"] = elapsed_ms(t0)
+
+        t0 = time.perf_counter()
         status = int(self.solver.solve())
+        profile["acados_solve_ms"] = elapsed_ms(t0)
         success = status == 0
 
+        t0 = time.perf_counter()
         dx = np.vstack([self.solver.get(k, "x")[:self.nx] for k in range(self.N + 1)])
         du = np.vstack([self.solver.get(k, "u") for k in range(self.N)])
         x_new = warm.x + dx
         u_new = warm.u + du
         traj_new = Trajectory(x_new, u_new)
         applied = self.problem.arm._clip_tau(traj_new.u[0])
+        profile["acados_get_solution_ms"] = elapsed_ms(t0)
 
+        t0 = time.perf_counter()
         cost_before = 0.5 * float(residuals @ residuals)
         eq_before_norm = float("nan")
         ineq_before_violation = float(
@@ -545,12 +616,16 @@ class AcadosRTISolver:
             eq_after_norm = float(np.linalg.norm(eq_after))
             ineq_after_violation = float(
                 np.min(np.minimum(ineq_after, 0.0)) if ineq_after.size else 0.0)
+        profile["post_solve_diagnostics_ms"] = elapsed_ms(t0)
 
+        t0 = time.perf_counter()
         if success:
             self.previous_trajectory = traj_new
         else:
             self.previous_trajectory = None
             applied = self.problem.previous_tau.copy()
+        profile["trajectory_commit_ms"] = elapsed_ms(t0)
+        profile["total_profiled_ms"] = elapsed_ms(total_start)
 
         diag = RTIDiagnostics(
             mpc_step=self.mpc_step,
@@ -569,6 +644,7 @@ class AcadosRTISolver:
             sqp_steps=1,
             qp_solve_attempts=1,
             fallback_used=not success,
+            profile_timings_ms=profile,
         )
         self.mpc_step += 1
 

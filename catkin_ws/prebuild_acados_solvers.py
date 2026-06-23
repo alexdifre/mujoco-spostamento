@@ -83,7 +83,7 @@ def parse_args():
                         default=default_acados_export_dir("ur10e_above"))
     parser.add_argument("--acados-insert-export-dir",
                         default=default_acados_export_dir("ur10e_insert"))
-    parser.add_argument("--acados-qp-solver", default="PARTIAL_CONDENSING_HPIPM")
+    parser.add_argument("--acados-qp-solver", default="FULL_CONDENSING_DAQP")
     parser.add_argument("--acados-qp-solver-iter-max", type=int, default=200)
     parser.add_argument("--acados-nlp-solver-type", default="SQP_RTI",
                         choices=["SQP_RTI", "SQP"])

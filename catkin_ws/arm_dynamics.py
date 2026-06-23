@@ -214,22 +214,33 @@ class ArmDynamics:
             h = self.compute_bias_forces()
             return np.linalg.solve(M, tau - h)
 
-    def bias_for_state(self, x):
-        """Return h(q,dq) for an arbitrary arm state without perturbing data."""
+    def step_dynamics_terms(self, x, tau):
+        """Return one dynamics evaluation used by MPC linearization.
+
+        The tuple contains the semi-implicit Euler next state, the mass
+        matrix, the inverse mass matrix, bias forces, clipped torque, and
+        acceleration. Keeping these together avoids repeated MuJoCo forward
+        passes for the same state/control pair.
+        """
         x = np.asarray(x, dtype=np.float64)
         if x.shape != (2 * self.n,):
             raise ValueError("state must have shape (12,)")
+        tau = self._clip_tau(tau)
+
         with self._preserve_state():
             self.set_state(x)
-            return self.compute_bias_forces()
+            M = self.compute_mass_matrix()
+            h = self.compute_bias_forces()
 
-    def step_dynamics(self, x, tau):
-        """Semi-implicit Euler transition x_next = f_arm(x, tau)."""
-        x = np.asarray(x, dtype=np.float64)
+        try:
+            Minv = np.linalg.solve(M, np.eye(self.n))
+            ddq = Minv @ (tau - h)
+        except np.linalg.LinAlgError:
+            Minv = np.linalg.pinv(M)
+            ddq = Minv @ (tau - h)
+
         q = x[:self.n].copy()
         dq = x[self.n:].copy()
-
-        ddq = self.forward_dynamics(x, tau)
         dq_next = dq + self.dt * ddq
         dq_next = np.minimum(np.maximum(dq_next, self.dq_min), self.dq_max)
 
@@ -245,9 +256,26 @@ class ArmDynamics:
             outward_low = hit_limit & (q_next < self.q_min) & (dq_next < 0.0)
             outward_high = hit_limit & (q_next > self.q_max) & (dq_next > 0.0)
             dq_next[outward_low | outward_high] = 0.0
-        q_next = q_clipped
+        x_next = np.concatenate([q_clipped, dq_next])
 
-        return np.concatenate([q_next, dq_next])
+        return x_next, M, Minv, h, tau, ddq
+
+    def bias_for_state(self, x):
+        """Return h(q,dq) for an arbitrary arm state without perturbing data."""
+        x = np.asarray(x, dtype=np.float64)
+        if x.shape != (2 * self.n,):
+            raise ValueError("state must have shape (12,)")
+        with self._preserve_state():
+            self.set_state(x)
+            return self.compute_bias_forces()
+
+    def step_dynamics(self, x, tau):
+        """Semi-implicit Euler transition x_next = f_arm(x, tau)."""
+        x = np.asarray(x, dtype=np.float64)
+        if x.shape != (2 * self.n,):
+            raise ValueError("state must have shape (12,)")
+        x_next, *_ = self.step_dynamics_terms(x, tau)
+        return x_next
 
     def forward_kinematics(self, q):
         """Return end-effector position and rotation matrix for q."""

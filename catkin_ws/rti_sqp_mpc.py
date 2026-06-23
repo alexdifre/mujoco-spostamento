@@ -13,7 +13,7 @@ This module is intentionally a solver layer. Robot-specific dynamics and
 forward kinematics are supplied by ProblemModel implementations such as
 ArmNMPCProblem below.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import osqp
@@ -93,6 +93,21 @@ class Trajectory:
         x = y[:x_count].reshape(horizon + 1, nx)
         u = y[x_count:].reshape(horizon, nu)
         return cls(x, u)
+
+
+@dataclass
+class DynamicsTrajectoryCache:
+    x_next: np.ndarray
+    A: np.ndarray
+    B: np.ndarray
+
+
+@dataclass
+class KinematicsTrajectoryCache:
+    pos: np.ndarray
+    rot: np.ndarray
+    Jp: np.ndarray
+    Jr: np.ndarray
 
 
 class EuclideanManifold:
@@ -338,8 +353,20 @@ class ArmNMPCProblem(ProblemModel):
         _, Jp = self._ee_pos_jacobian(x)
         return Jp @ x[self.n:]
 
-    def residuals(self, y):
+    def kinematics_cache_for_trajectory(self, trajectory):
+        traj = trajectory
+        pos = np.empty((self.horizon + 1, 3), dtype=np.float64)
+        rot = np.empty((self.horizon + 1, 3, 3), dtype=np.float64)
+        Jp = np.empty((self.horizon + 1, 3, self.n), dtype=np.float64)
+        Jr = np.empty((self.horizon + 1, 3, self.n), dtype=np.float64)
+        for k in range(self.horizon + 1):
+            pos[k], rot[k], Jp[k], Jr[k] = \
+                self.arm.forward_kinematics_jacobian(traj.x[k, :self.n])
+        return KinematicsTrajectoryCache(pos=pos, rot=rot, Jp=Jp, Jr=Jr)
+
+    def residuals(self, y, kinematics_cache=None):
         traj = self._traj(y)
+        kin_cache = kinematics_cache or self.kinematics_cache_for_trajectory(traj)
         residuals = []
         sqrt_Qp = np.sqrt(self.Qp)
         sqrt_Qpv = np.sqrt(self.Qpv)
@@ -355,11 +382,13 @@ class ArmNMPCProblem(ProblemModel):
         previous_tau = self.previous_tau
 
         for k in range(self.horizon):
-            pos, rot = self.arm.forward_kinematics(traj.x[k, :self.n])
+            pos = kin_cache.pos[k]
+            rot = kin_cache.rot[k]
+            Jp = kin_cache.Jp[k]
             residuals.append(sqrt_Qp * (pos - self.p_refs[k]))
             residuals.append(sqrt_Qaxis * (
                 rot[:, self.terminal_axis_index] - self.terminal_axis))
-            residuals.append(sqrt_Qpv * (self._ee_velocity(traj.x[k])
+            residuals.append(sqrt_Qpv * (Jp @ traj.x[k, self.n:]
                                          - self.v_refs[k]))
             residuals.append(sqrt_Qq * (traj.x[k, :self.n]
                                         - self.q_nominal))
@@ -368,19 +397,22 @@ class ArmNMPCProblem(ProblemModel):
             residuals.append(sqrt_Rd * (traj.u[k] - previous_tau))
             previous_tau = traj.u[k]
 
-        pos, rot = self.arm.forward_kinematics(traj.x[-1, :self.n])
+        pos = kin_cache.pos[-1]
+        rot = kin_cache.rot[-1]
+        Jp = kin_cache.Jp[-1]
         residuals.append(sqrt_Qf * (pos - self.p_refs[-1]))
         residuals.append(sqrt_Qaxisf * (
             rot[:, self.terminal_axis_index] - self.terminal_axis))
-        residuals.append(sqrt_Qpv * (self._ee_velocity(traj.x[-1])
+        residuals.append(sqrt_Qpv * (Jp @ traj.x[-1, self.n:]
                                      - self.v_refs[-1]))
         residuals.append(sqrt_Qqf * (traj.x[-1, :self.n]
                                      - self.q_terminal))
         residuals.append(sqrt_Qvf * traj.x[-1, 6:])
         return np.concatenate(residuals)
 
-    def residuals_with_jacobian(self, y):
+    def residuals_with_jacobian(self, y, kinematics_cache=None):
         traj = self._traj(y)
+        kin_cache = kinematics_cache or self.kinematics_cache_for_trajectory(traj)
         y_size = y.size
         nrows = self.horizon * (3 + 3 + 3 + self.n + self.n
                                 + self.nu + self.nu) \
@@ -405,8 +437,10 @@ class ArmNMPCProblem(ProblemModel):
         for k in range(self.horizon):
             x_cols = k * x_stride
             u_cols = u_base + k * self.nu
-            pos, rot, Jp, Jr = self.arm.forward_kinematics_jacobian(
-                traj.x[k, :self.n])
+            pos = kin_cache.pos[k]
+            rot = kin_cache.rot[k]
+            Jp = kin_cache.Jp[k]
+            Jr = kin_cache.Jr[k]
 
             residuals.append(sqrt_Qp * (pos - self.p_refs[k]))
             jac[row:row + 3, x_cols:x_cols + self.n] = \
@@ -460,8 +494,10 @@ class ArmNMPCProblem(ProblemModel):
             row += self.nu
 
         x_cols = self.horizon * x_stride
-        pos, rot, Jp, Jr = self.arm.forward_kinematics_jacobian(
-            traj.x[-1, :self.n])
+        pos = kin_cache.pos[-1]
+        rot = kin_cache.rot[-1]
+        Jp = kin_cache.Jp[-1]
+        Jr = kin_cache.Jr[-1]
         residuals.append(sqrt_Qf * (pos - self.p_refs[-1]))
         jac[row:row + 3, x_cols:x_cols + self.n] = sqrt_Qf[:, None] * Jp
         row += 3
@@ -504,24 +540,17 @@ class ArmNMPCProblem(ProblemModel):
     def equality_constraints(self, y):
         traj = self._traj(y)
         constraints = [traj.x[0] - self.current_state]
+        dyn_cache = self.dynamics_cache_for_trajectory(traj)
         for k in range(self.horizon):
-            x_next = self.arm.step_dynamics(traj.x[k], traj.u[k])
-            constraints.append(traj.x[k + 1] - x_next)
+            constraints.append(traj.x[k + 1] - dyn_cache.x_next[k])
         return np.concatenate(constraints)
 
-    def _local_dynamics_linearization(self, x, u):
+    def _dynamics_step_linearization(self, x, u):
         x = np.asarray(x, dtype=np.float64)
         if x.shape != (self.nx,):
             raise ValueError(f"x must have shape {(self.nx,)}")
 
-        with self.arm._preserve_state():
-            self.arm.set_state(x)
-            M = self.arm.compute_mass_matrix()
-
-        try:
-            Minv = np.linalg.solve(M, np.eye(self.n))
-        except np.linalg.LinAlgError:
-            Minv = np.linalg.pinv(M)
+        x_next, _, Minv, _, _, _ = self.arm.step_dynamics_terms(x, u)
 
         dt = float(self.arm.dt)
         A = np.zeros((self.nx, self.nx), dtype=np.float64)
@@ -534,7 +563,23 @@ class ArmNMPCProblem(ProblemModel):
         B[:self.n, :] = dt * dt * Minv
         B[self.n:, :] = dt * Minv
 
+        return x_next, A, B
+
+    def _local_dynamics_linearization(self, x, u):
+        _, A, B = self._dynamics_step_linearization(x, u)
         return A, B
+
+    def dynamics_cache_for_trajectory(self, trajectory):
+        traj = trajectory
+        x_next = np.empty((self.horizon, self.nx), dtype=np.float64)
+        A = np.empty((self.horizon, self.nx, self.nx), dtype=np.float64)
+        B = np.empty((self.horizon, self.nx, self.nu), dtype=np.float64)
+        for k in range(self.horizon):
+            x_next[k], A[k], B[k] = self._dynamics_step_linearization(
+                traj.x[k],
+                traj.u[k],
+            )
+        return DynamicsTrajectoryCache(x_next=x_next, A=A, B=B)
 
     def equality_constraints_with_jacobian(self, y):
         traj = self._traj(y)
@@ -546,6 +591,7 @@ class ArmNMPCProblem(ProblemModel):
 
         constraints.append(traj.x[0] - self.current_state)
         jac[0:self.nx, 0:self.nx] = sp.eye(self.nx, format="csc")
+        dyn_cache = self.dynamics_cache_for_trajectory(traj)
 
         for k in range(self.horizon):
             row = (k + 1) * self.nx
@@ -553,12 +599,9 @@ class ArmNMPCProblem(ProblemModel):
             x_next_cols = (k + 1) * x_stride
             u_cols = u_base + k * self.nu
 
-            x_next = self.arm.step_dynamics(traj.x[k], traj.u[k])
-            constraints.append(traj.x[k + 1] - x_next)
-            A, B = self._local_dynamics_linearization(
-                traj.x[k],
-                traj.u[k],
-            )
+            constraints.append(traj.x[k + 1] - dyn_cache.x_next[k])
+            A = dyn_cache.A[k]
+            B = dyn_cache.B[k]
 
             jac[row:row + self.nx,
                 x_cols:x_cols + self.nx] = -A
@@ -572,8 +615,11 @@ class ArmNMPCProblem(ProblemModel):
 
         return np.concatenate(constraints), jac.tocsc()
 
-    def inequality_constraints(self, y):
+    def inequality_constraints(self, y, kinematics_cache=None):
         traj = self._traj(y)
+        kin_cache = None
+        if self.obstacles:
+            kin_cache = kinematics_cache or self.kinematics_cache_for_trajectory(traj)
         values = []
         if self.collision_model is not None:
             values.append(self.collision_model.residuals_for_trajectory(
@@ -584,7 +630,7 @@ class ArmNMPCProblem(ProblemModel):
 
         for k in range(self.horizon + 1):
             for obstacle in self.obstacles:
-                pos = self._ee_pos(traj.x[k])
+                pos = kin_cache.pos[k]
                 center = np.asarray(obstacle["center"], dtype=np.float64)
                 radius = float(obstacle["radius"]) + self.safety_margin
                 values.append(float(np.linalg.norm(pos[:2] - center[:2])
@@ -595,8 +641,11 @@ class ArmNMPCProblem(ProblemModel):
             np.atleast_1d(v).astype(np.float64) for v in values
         ])
 
-    def inequality_constraints_with_jacobian(self, y):
+    def inequality_constraints_with_jacobian(self, y, kinematics_cache=None):
         traj = self._traj(y)
+        kin_cache = None
+        if self.obstacles:
+            kin_cache = kinematics_cache or self.kinematics_cache_for_trajectory(traj)
         values = []
         rows = []
         cols = []
@@ -627,7 +676,8 @@ class ArmNMPCProblem(ProblemModel):
 
         for k in range(self.horizon + 1):
             for obstacle in self.obstacles:
-                pos, Jp = self._ee_pos_jacobian(traj.x[k])
+                pos = kin_cache.pos[k]
+                Jp = kin_cache.Jp[k]
                 center = np.asarray(obstacle["center"], dtype=np.float64)
                 radius = float(obstacle["radius"]) + self.safety_margin
                 delta_xy = pos[:2] - center[:2]
@@ -865,6 +915,7 @@ class RTIDiagnostics:
     sqp_steps: int
     qp_solve_attempts: int
     fallback_used: bool
+    profile_timings_ms: dict = field(default_factory=dict)
 
 
 class RTISolver:

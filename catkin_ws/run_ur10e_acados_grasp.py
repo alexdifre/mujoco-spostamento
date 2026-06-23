@@ -497,7 +497,7 @@ def parse_args():
     parser.add_argument("--max-path-lead", type=float, default=0.08)
     parser.add_argument("--waypoint-tracking-tol", type=float, default=0.08)
     parser.add_argument("--acados-export-dir", default=str(Path("acados_generated") / "ur10e_rti_grasp"))
-    parser.add_argument("--acados-qp-solver", default="PARTIAL_CONDENSING_HPIPM")
+    parser.add_argument("--acados-qp-solver", default="FULL_CONDENSING_DAQP")
     parser.add_argument("--acados-qp-solver-iter-max", type=int, default=200)
     parser.add_argument("--acados-nlp-solver-type", default="SQP_RTI")
     parser.add_argument("--regularization", type=float, default=1e-8)

@@ -258,10 +258,7 @@ def make_solver(args, env, initial_pos, target_pos, export_suffix=""):
     collision_model = None
     if args.collision_constraints:
         box_sdf = default_table_box_sdf() if args.include_box else None
-        excluded_obstacles = []
-        if not args.avoid_target_cylinder:
-            excluded_obstacles.append(
-                f"pddl_{args.target_cylinder.replace('-', '_')}_cylinder")
+        target_obstacle_name = f"pddl_{args.target_cylinder.replace('-', '_')}_cylinder"
         collision_model = make_default_ur10e_collision_model(
             env,
             arm,
@@ -270,7 +267,8 @@ def make_solver(args, env, initial_pos, target_pos, export_suffix=""):
             d_ground=args.d_ground,
             d_safe=args.d_safe,
             d_box=args.d_box,
-            excluded_obstacle_names=excluded_obstacles,
+            target_obstacle_name=target_obstacle_name,
+            target_d_safe_factor=0.5,
         )
     problem = ArmNMPCProblem(
         arm,
@@ -749,7 +747,7 @@ def parse_args(argv=None):
                         action="store_false",
                         help="disable collision/ground constraints for smoother playback")
     parser.add_argument("--avoid-target-cylinder", action="store_true",
-                        help="also treat the selected target cylinder as an obstacle")
+                        help="deprecated no-op; the target cylinder is always constrained with half safety distance")
     parser.add_argument("--regularization", type=float, default=1e-5)
     parser.add_argument(
         "--acados-export-dir",
@@ -761,7 +759,7 @@ def parse_args(argv=None):
     parser.add_argument("--acados-insert-export-dir",
                         default=default_acados_export_dir("ur10e_insert"),
                         help="prebuilt acados solver directory for the vertical insert/return phase")
-    parser.add_argument("--acados-qp-solver", default="PARTIAL_CONDENSING_HPIPM",
+    parser.add_argument("--acados-qp-solver", default="FULL_CONDENSING_DAQP",
                         help="acados QP solver")
     parser.add_argument("--acados-qp-solver-iter-max", type=int, default=200,
                         help="maximum acados QP iterations")
