@@ -5,7 +5,6 @@ import sys
 import time
 from collections import deque
 
-import mujoco
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -147,19 +146,6 @@ def reference_horizon_distances(start_distance, horizon, dt, speed,
     return distances
 
 
-def reference_horizon_from_path(waypoints, arclengths, start_distance,
-                                horizon, dt, speed, lookahead=0.0):
-    distances = reference_horizon_distances(
-        start_distance,
-        horizon,
-        dt,
-        speed,
-        lookahead=lookahead,
-        total_distance=float(arclengths[-1]),
-    )
-    return sample_waypoint_path(waypoints, arclengths, distances)
-
-
 def reference_velocities_from_path(waypoints, arclengths, distances, speed):
     waypoints = np.asarray(waypoints, dtype=np.float64)
     arclengths = np.asarray(arclengths, dtype=np.float64)
@@ -251,7 +237,7 @@ def phase_acados_export_dir(args, export_suffix=""):
     return resolve_acados_export_dir(directory)
 
 
-def make_solver(args, env, initial_pos, target_pos, export_suffix=""):
+def make_solver(args, env, initial_pos, export_suffix=""):
     arm = ArmDynamics.from_robot(env.robot, dt=args.mpc_dt)
     initial_pos = np.asarray(initial_pos, dtype=np.float64)
     refs = np.repeat(initial_pos[None, :], args.horizon + 1, axis=0)
@@ -350,7 +336,6 @@ def run_with_env(args, env, viewer=None):
         args,
         env,
         initial_ee_pos,
-        target,
     )
 
     dt = robot.model.opt.timestep
@@ -432,7 +417,6 @@ def run_with_env(args, env, viewer=None):
                         args,
                         env,
                         robot.ee_pos.copy(),
-                        target,
                         export_suffix="vertical",
                     )
                     problem.set_previous_tau(current_tau)
@@ -746,13 +730,7 @@ def parse_args(argv=None):
                         dest="collision_constraints",
                         action="store_false",
                         help="disable collision/ground constraints for smoother playback")
-    parser.add_argument("--avoid-target-cylinder", action="store_true",
-                        help="deprecated no-op; the target cylinder is always constrained with half safety distance")
     parser.add_argument("--regularization", type=float, default=1e-5)
-    parser.add_argument(
-        "--acados-export-dir",
-        default=default_acados_export_dir(),
-                        help="deprecated alias for --acados-above-export-dir")
     parser.add_argument("--acados-above-export-dir",
                         default=default_acados_export_dir("ur10e_above"),
                         help="prebuilt acados solver directory for the above/approach phase")
@@ -770,8 +748,6 @@ def parse_args(argv=None):
                         help="print acados generation and solver output")
     parser.add_argument("--fast-control", action="store_true",
                         help="skip expensive post-solve diagnostics in the realtime MPC loop")
-    parser.add_argument("--acados-runtime-only", action="store_true",
-                        help="deprecated no-op; runtime is load-only unless --build-acados is set")
     parser.add_argument("--build-acados", action="store_true",
                         help="allow acados code generation and CMake build in this process")
     parser.add_argument("--delta-q-max", type=float, default=0.12)
@@ -799,10 +775,7 @@ def parse_args(argv=None):
     parser.add_argument("--tcp-marker-radius", type=float, default=0.004,
                         help="radius of the cyan marker showing robot.ee_pos")
     parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args(argv)
-    if args.acados_export_dir != default_acados_export_dir():
-        args.acados_above_export_dir = args.acados_export_dir
-    return args
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":

@@ -201,19 +201,6 @@ class ArmDynamics:
             tau = np.minimum(np.maximum(tau, self.tau_min), self.tau_max)
         return tau
 
-    def forward_dynamics(self, x, tau):
-        """Return ddq from M(q) ddq = tau - qfrc_bias."""
-        x = np.asarray(x, dtype=np.float64)
-        if x.shape != (2 * self.n,):
-            raise ValueError("state must have shape (12,)")
-        tau = self._clip_tau(tau)
-
-        with self._preserve_state():
-            self.set_state(x)
-            M = self.compute_mass_matrix()
-            h = self.compute_bias_forces()
-            return np.linalg.solve(M, tau - h)
-
     def step_dynamics_terms(self, x, tau):
         """Return one dynamics evaluation used by MPC linearization.
 
@@ -277,24 +264,6 @@ class ArmDynamics:
         x_next, *_ = self.step_dynamics_terms(x, tau)
         return x_next
 
-    def forward_kinematics(self, q):
-        """Return end-effector position and rotation matrix for q."""
-        q = np.asarray(q, dtype=np.float64)
-        if q.shape != (self.n,):
-            raise ValueError("q must have shape (6,)")
-
-        with self._preserve_state():
-            self.data.qpos[self.qpos_addr] = q
-            self.data.qvel[self.dof_addr] = 0.0
-            mujoco.mj_forward(self.model, self.data)
-            if self.ee_site_id >= 0:
-                pos = self.data.site_xpos[self.ee_site_id].copy()
-                rot = self.data.site_xmat[self.ee_site_id].reshape(3, 3).copy()
-            else:
-                pos = self.data.xpos[self.ee_body_id].copy()
-                rot = self.data.xmat[self.ee_body_id].reshape(3, 3).copy()
-        return pos, rot
-
     def forward_kinematics_jacobian(self, q):
         """Return end-effector pose and MuJoCo point Jacobians for q.
 
@@ -324,9 +293,3 @@ class ArmDynamics:
             Jp = jacp[:, self.dof_addr].copy()
             Jr = jacr[:, self.dof_addr].copy()
         return pos, rot, Jp, Jr
-
-    def apply_torque_control(self, tau):
-        """Write arm torque controls to the six arm actuators only."""
-        tau = self._clip_tau(tau)
-        self.data.ctrl[self.actuator_ids] = tau
-        return tau

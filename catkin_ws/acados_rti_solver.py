@@ -154,7 +154,6 @@ class AcadosRTISolver:
                 include_box=True,
                 allow_box_contact_geometry=False,
             ).size)
-        count += len(self.problem.obstacles)
         return count
 
     @property
@@ -233,8 +232,7 @@ class AcadosRTISolver:
             raise RuntimeError(
                 "precompiled acados solver is missing or stale: "
                 f"{self.config.code_export_directory}. "
-                "Run catkin_ws/prebuild_acados_solvers.py offline first, "
-                "or pass --build-acados explicitly."
+                "Pass --build-acados explicitly to regenerate it."
             )
 
         z = ca.SX.sym("z", self.nz)

@@ -1,27 +1,9 @@
 #!/usr/bin/env python3
-"""
-Real-Time Iteration / pathfollowing SQP utilities for nonlinear MPC.
-
-The solver performs exactly one SQP correction per MPC call:
-  1. shift the previous trajectory,
-  2. linearize the nonlinear problem at the shifted warm start,
-  3. solve one local QP in trajectory increments,
-  4. retract the updated trajectory,
-  5. apply only the first control.
-
-This module is intentionally a solver layer. Robot-specific dynamics and
-forward kinematics are supplied by ProblemModel implementations such as
-ArmNMPCProblem below.
-"""
+"""Numerical UR10e NMPC problem used by the acados RTI solver."""
 from dataclasses import dataclass, field
 
 import numpy as np
-import osqp
 import scipy.sparse as sp
-
-
-def wrap_to_pi(theta):
-    return (theta + np.pi) % (2.0 * np.pi) - np.pi
 
 
 def skew(v):
@@ -30,16 +12,6 @@ def skew(v):
         [v[2], 0.0, -v[0]],
         [-v[1], v[0], 0.0],
     ], dtype=np.float64)
-
-
-def so3_exp(omega):
-    theta = float(np.linalg.norm(omega))
-    K = skew(omega)
-    if theta < 1e-12:
-        return np.eye(3) + K
-    A = np.sin(theta) / theta
-    B = (1.0 - np.cos(theta)) / (theta * theta)
-    return np.eye(3) + A * K + B * (K @ K)
 
 
 def rotation_axis_jacobian(rot, Jr, axis_index=2):
@@ -73,13 +45,6 @@ class Trajectory:
     def nu(self):
         return self.u.shape[1]
 
-    @property
-    def dim(self):
-        return self.x.size + self.u.size
-
-    def copy(self):
-        return Trajectory(self.x.copy(), self.u.copy())
-
     def stack(self):
         return np.concatenate([self.x.reshape(-1), self.u.reshape(-1)])
 
@@ -110,103 +75,7 @@ class KinematicsTrajectoryCache:
     Jr: np.ndarray
 
 
-class EuclideanManifold:
-    def retract(self, point, tangent_increment):
-        return np.asarray(point) + np.asarray(tangent_increment)
-
-
-class TorusManifold:
-    def retract(self, point, tangent_increment):
-        return wrap_to_pi(np.asarray(point) + np.asarray(tangent_increment))
-
-
-class UnitVectorManifold:
-    def retract(self, point, tangent_increment):
-        y = np.asarray(point, dtype=np.float64) + np.asarray(tangent_increment)
-        norm = float(np.linalg.norm(y))
-        if norm < 1e-12:
-            raise ValueError("cannot retract a near-zero unit vector")
-        return y / norm
-
-
-class SO3Manifold:
-    def retract(self, point, tangent_increment):
-        R = np.asarray(point, dtype=np.float64).reshape(3, 3)
-        dR = so3_exp(np.asarray(tangent_increment, dtype=np.float64))
-        return R @ dR
-
-
-class ArmStateManifold:
-    """State retraction for x = [q, dq].
-
-    Joint angles are optionally wrapped on T^6. If the robot model uses hard
-    position limits, keep wrap_joints=False and rely on QP bounds.
-    """
-
-    def __init__(self, n_joints=6, wrap_joints=False):
-        self.n = int(n_joints)
-        self.wrap_joints = bool(wrap_joints)
-
-    def retract(self, point, tangent_increment):
-        x = np.asarray(point, dtype=np.float64)
-        dx = np.asarray(tangent_increment, dtype=np.float64)
-        y = x + dx
-        if self.wrap_joints:
-            y[:self.n] = wrap_to_pi(y[:self.n])
-        return y
-
-
-class TrajectoryManifold:
-    def __init__(self, horizon, nx, nu, state_manifold=None,
-                 control_manifold=None):
-        self.horizon = int(horizon)
-        self.nx = int(nx)
-        self.nu = int(nu)
-        self.state_manifold = state_manifold or EuclideanManifold()
-        self.control_manifold = control_manifold or EuclideanManifold()
-
-    def retract_vector(self, y, delta_y):
-        traj = Trajectory.from_vector(y, self.horizon, self.nx, self.nu)
-        delta = Trajectory.from_vector(delta_y, self.horizon, self.nx, self.nu)
-        x_new = np.vstack([
-            self.state_manifold.retract(traj.x[k], delta.x[k])
-            for k in range(self.horizon + 1)
-        ])
-        u_new = np.vstack([
-            self.control_manifold.retract(traj.u[k], delta.u[k])
-            for k in range(self.horizon)
-        ])
-        return Trajectory(x_new, u_new).stack()
-
-
-class ProblemModel:
-    horizon: int
-    nx: int
-    nu: int
-
-    def make_initial_trajectory(self, measured_state):
-        raise NotImplementedError
-
-    def shift_trajectory(self, trajectory, measured_state):
-        raise NotImplementedError
-
-    def cost(self, y):
-        raise NotImplementedError
-
-    def residuals(self, y):
-        return None
-
-    def equality_constraints(self, y):
-        raise NotImplementedError
-
-    def inequality_constraints(self, y):
-        return np.zeros(0)
-
-    def delta_bounds(self, y):
-        return (np.full_like(y, -np.inf), np.full_like(y, np.inf))
-
-
-class ArmNMPCProblem(ProblemModel):
+class ArmNMPCProblem:
     """Nonlinear arm NMPC problem using joint-space ArmDynamics."""
 
     def __init__(self, arm_dynamics, horizon, p_refs,
@@ -214,7 +83,6 @@ class ArmNMPCProblem(ProblemModel):
                  Qf=None, Qaxis=None, Qaxisf=None, Qqf=None, Qvf=None,
                  Rd=None,
                  q_nominal=None, q_terminal=None, previous_tau=None,
-                 obstacles=None, safety_margin=0.03,
                  collision_model=None, box_active_mask=None,
                  box_contact_allowed_mask=None,
                  terminal_axis=None, terminal_axis_index=2,
@@ -254,8 +122,6 @@ class ArmNMPCProblem(ProblemModel):
             dtype=np.float64,
         )
         self.terminal_axis_index = int(terminal_axis_index)
-        self.obstacles = list(obstacles or [])
-        self.safety_margin = float(safety_margin)
         self.collision_model = collision_model
         self.delta_q_max = np.asarray(
             delta_q_max if delta_q_max is not None else [0.12] * 6,
@@ -340,18 +206,6 @@ class ArmNMPCProblem(ProblemModel):
         shifted_x[-1] = self.arm.step_dynamics(shifted_x[-2],
                                                shifted_u[-1])
         return Trajectory(shifted_x, shifted_u)
-
-    def _ee_pos(self, x):
-        pos, _ = self.arm.forward_kinematics(x[:6])
-        return pos
-
-    def _ee_pos_jacobian(self, x):
-        pos, _, Jp, _ = self.arm.forward_kinematics_jacobian(x[:6])
-        return pos, Jp
-
-    def _ee_velocity(self, x):
-        _, Jp = self._ee_pos_jacobian(x)
-        return Jp @ x[self.n:]
 
     def kinematics_cache_for_trajectory(self, trajectory):
         traj = trajectory
@@ -565,10 +419,6 @@ class ArmNMPCProblem(ProblemModel):
 
         return x_next, A, B
 
-    def _local_dynamics_linearization(self, x, u):
-        _, A, B = self._dynamics_step_linearization(x, u)
-        return A, B
-
     def dynamics_cache_for_trajectory(self, trajectory):
         traj = trajectory
         x_next = np.empty((self.horizon, self.nx), dtype=np.float64)
@@ -617,9 +467,6 @@ class ArmNMPCProblem(ProblemModel):
 
     def inequality_constraints(self, y, kinematics_cache=None):
         traj = self._traj(y)
-        kin_cache = None
-        if self.obstacles:
-            kin_cache = kinematics_cache or self.kinematics_cache_for_trajectory(traj)
         values = []
         if self.collision_model is not None:
             values.append(self.collision_model.residuals_for_trajectory(
@@ -628,13 +475,6 @@ class ArmNMPCProblem(ProblemModel):
                 box_contact_allowed_mask=self.box_contact_allowed_mask,
             ))
 
-        for k in range(self.horizon + 1):
-            for obstacle in self.obstacles:
-                pos = kin_cache.pos[k]
-                center = np.asarray(obstacle["center"], dtype=np.float64)
-                radius = float(obstacle["radius"]) + self.safety_margin
-                values.append(float(np.linalg.norm(pos[:2] - center[:2])
-                                    - radius))
         if not values:
             return np.zeros(0)
         return np.concatenate([
@@ -643,9 +483,6 @@ class ArmNMPCProblem(ProblemModel):
 
     def inequality_constraints_with_jacobian(self, y, kinematics_cache=None):
         traj = self._traj(y)
-        kin_cache = None
-        if self.obstacles:
-            kin_cache = kinematics_cache or self.kinematics_cache_for_trajectory(traj)
         values = []
         rows = []
         cols = []
@@ -673,25 +510,6 @@ class ArmNMPCProblem(ProblemModel):
                 for value, jac_q in zip(vals_k, jac_q_k):
                     values.append(float(value))
                     append_q_row(k, jac_q)
-
-        for k in range(self.horizon + 1):
-            for obstacle in self.obstacles:
-                pos = kin_cache.pos[k]
-                Jp = kin_cache.Jp[k]
-                center = np.asarray(obstacle["center"], dtype=np.float64)
-                radius = float(obstacle["radius"]) + self.safety_margin
-                delta_xy = pos[:2] - center[:2]
-                norm_xy = float(np.linalg.norm(delta_xy))
-                values.append(norm_xy - radius)
-                if norm_xy > 1e-12:
-                    grad_pos = np.array([
-                        delta_xy[0] / norm_xy,
-                        delta_xy[1] / norm_xy,
-                        0.0,
-                    ], dtype=np.float64)
-                else:
-                    grad_pos = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-                append_q_row(k, grad_pos @ Jp)
 
         if not values:
             return np.zeros(0), sp.csc_matrix((0, y_size))
@@ -756,148 +574,6 @@ class ArmNMPCProblem(ProblemModel):
 
 
 @dataclass
-class DerivativeData:
-    cost_value: float
-    equality: np.ndarray
-    inequality: np.ndarray
-    grad_cost: np.ndarray
-    hessian: sp.csc_matrix
-    jac_eq: sp.csc_matrix
-    jac_ineq: sp.csc_matrix
-
-
-class AnalyticDerivativeProvider:
-    """Derivative provider that requires problem-supplied Jacobian hooks."""
-
-    def __init__(self, problem, hessian_mode="gauss_newton",
-                 diagonal_hessian=1.0):
-        self.problem = problem
-        self.hessian_mode = hessian_mode
-        self.diagonal_hessian = float(diagonal_hessian)
-
-    def _required_hook(self, name):
-        hook = getattr(self.problem, name, None)
-        if hook is None:
-            raise NotImplementedError(
-                f"{type(self.problem).__name__} must implement {name}"
-            )
-        return hook
-
-    def evaluate(self, y, lambda_bar=None, mu_bar=None):
-        cost_value = float(self.problem.cost(y))
-        equality, jac_eq = self._required_hook(
-            "equality_constraints_with_jacobian")(y)
-        inequality, jac_ineq = self._required_hook(
-            "inequality_constraints_with_jacobian")(y)
-        if self.hessian_mode != "gauss_newton":
-            raise NotImplementedError(
-                "only gauss_newton Hessians are supported here"
-            )
-
-        residuals, jac_res = self._required_hook("residuals_with_jacobian")(y)
-        grad_cost = np.asarray(jac_res.T @ residuals).reshape(-1)
-        hessian = jac_res.T @ jac_res
-
-        return DerivativeData(cost_value, equality, inequality, grad_cost,
-                              hessian.tocsc(), jac_eq, jac_ineq)
-
-
-class HybridDerivativeProvider(AnalyticDerivativeProvider):
-    """Preferred provider name for the current analytic derivative hooks."""
-
-
-@dataclass
-class QPData:
-    H: sp.csc_matrix
-    g: np.ndarray
-    A: sp.csc_matrix
-    lower: np.ndarray
-    upper: np.ndarray
-    n_eq: int
-    n_ineq: int
-    n_bounds: int
-
-
-class QPBuilder:
-    def __init__(self, regularization=1e-6):
-        self.regularization = float(regularization)
-
-    def build(self, derivative_data, delta_lower, delta_upper,
-              regularization=None):
-        rho = self.regularization if regularization is None else regularization
-        n = derivative_data.grad_cost.size
-        H = derivative_data.hessian + rho * sp.eye(n, format="csc")
-        g = derivative_data.grad_cost
-
-        blocks = []
-        lower = []
-        upper = []
-
-        if derivative_data.jac_eq.shape[0]:
-            blocks.append(derivative_data.jac_eq)
-            rhs = -derivative_data.equality
-            lower.append(rhs)
-            upper.append(rhs)
-
-        if derivative_data.jac_ineq.shape[0]:
-            blocks.append(derivative_data.jac_ineq)
-            lower.append(-derivative_data.inequality)
-            upper.append(np.full(derivative_data.inequality.shape, np.inf))
-
-        blocks.append(sp.eye(n, format="csc"))
-        lower.append(np.asarray(delta_lower, dtype=np.float64))
-        upper.append(np.asarray(delta_upper, dtype=np.float64))
-
-        A = sp.vstack(blocks, format="csc")
-        l = np.concatenate(lower)
-        u = np.concatenate(upper)
-        return QPData(H.tocsc(), g, A, l, u,
-                      derivative_data.jac_eq.shape[0],
-                      derivative_data.jac_ineq.shape[0],
-                      n)
-
-
-@dataclass
-class QPResult:
-    delta_y: np.ndarray
-    dual: np.ndarray
-    status: str
-    status_val: int
-    iterations: int
-    objective: float
-    success: bool
-
-
-class OSQPSolver:
-    def __init__(self, eps_abs=1e-5, eps_rel=1e-5, max_iter=2000):
-        self.eps_abs = float(eps_abs)
-        self.eps_rel = float(eps_rel)
-        self.max_iter = int(max_iter)
-
-    def solve(self, qp_data, primal_warm_start=None, dual_warm_start=None):
-        solver = osqp.OSQP()
-        solver.setup(qp_data.H, qp_data.g, qp_data.A,
-                     qp_data.lower, qp_data.upper,
-                     verbose=False,
-                     warm_starting=True,
-                     eps_abs=self.eps_abs,
-                     eps_rel=self.eps_rel,
-                     max_iter=self.max_iter,
-                     polishing=False)
-        if primal_warm_start is not None:
-            solver.warm_start(x=primal_warm_start, y=dual_warm_start)
-        result = solver.solve()
-        success = result.info.status_val in (1, 2)
-        delta = result.x if result.x is not None else np.zeros_like(qp_data.g)
-        dual = result.y if result.y is not None else np.zeros(qp_data.A.shape[0])
-        return QPResult(delta, dual, result.info.status,
-                        int(result.info.status_val),
-                        int(result.info.iter),
-                        float(result.info.obj_val),
-                        success)
-
-
-@dataclass
 class RTIDiagnostics:
     mpc_step: int
     cost_before: float
@@ -916,136 +592,3 @@ class RTIDiagnostics:
     qp_solve_attempts: int
     fallback_used: bool
     profile_timings_ms: dict = field(default_factory=dict)
-
-
-class RTISolver:
-    """One-step pathfollowing SQP / RTI solver."""
-
-    def __init__(self, problem, derivative_provider=None, qp_builder=None,
-                 qp_solver=None, manifold=None, alpha=1.0,
-                 fallback_regularization=(1e-4, 1e-2, 1.0),
-        debug=False):
-        self.problem = problem
-        self.derivatives = derivative_provider or \
-            HybridDerivativeProvider(problem)
-        self.qp_builder = qp_builder or QPBuilder()
-        self.qp_solver = qp_solver or OSQPSolver()
-        self.manifold = manifold or TrajectoryManifold(
-            problem.horizon, problem.nx, problem.nu)
-        self.alpha = float(alpha)
-        self.fallback_regularization = tuple(fallback_regularization)
-        self.debug = bool(debug)
-        self.previous_trajectory = None
-        self.previous_lambda = None
-        self.previous_mu = None
-        self.previous_delta = None
-        self.mpc_step = 0
-
-    def _warm_start(self, measured_state):
-        if self.previous_trajectory is None:
-            return self.problem.make_initial_trajectory(measured_state)
-        return self.problem.shift_trajectory(self.previous_trajectory,
-                                             measured_state)
-
-    def _split_duals(self, qp_data, dual):
-        n_eq = qp_data.n_eq
-        n_ineq = qp_data.n_ineq
-        lam = dual[:n_eq].copy()
-        mu = dual[n_eq:n_eq + n_ineq].copy()
-        return lam, mu
-
-    def step(self, measured_state):
-        self.problem.prepare_step(measured_state)
-        warm = self._warm_start(measured_state)
-        y_bar = warm.stack()
-
-        deriv = self.derivatives.evaluate(
-            y_bar, self.previous_lambda, self.previous_mu)
-        delta_lower, delta_upper = self.problem.delta_bounds(y_bar)
-
-        regularizations = (self.qp_builder.regularization,) + \
-            self.fallback_regularization
-        qp_result = None
-        qp_data = None
-        attempts = 0
-        for rho in regularizations:
-            attempts += 1
-            qp_data = self.qp_builder.build(deriv, delta_lower, delta_upper,
-                                            regularization=rho)
-            qp_result = self.qp_solver.solve(
-                qp_data,
-                primal_warm_start=self.previous_delta,
-                dual_warm_start=None,
-            )
-            if qp_result.success:
-                break
-
-        fallback_used = not qp_result.success
-        if fallback_used:
-            delta = np.zeros_like(y_bar)
-            y_new = y_bar.copy()
-            traj_new = warm
-            if hasattr(self.problem, "previous_tau"):
-                applied = self.problem.previous_tau.copy()
-            else:
-                applied = traj_new.u[0].copy()
-            lam = np.zeros(deriv.equality.size)
-            mu = np.zeros(deriv.inequality.size)
-        else:
-            delta = self.alpha * qp_result.delta_y
-            y_new = self.manifold.retract_vector(y_bar, delta)
-            traj_new = Trajectory.from_vector(
-                y_new, self.problem.horizon, self.problem.nx, self.problem.nu)
-            applied = traj_new.u[0].copy()
-            lam, mu = self._split_duals(qp_data, qp_result.dual)
-
-        cost_after = float(self.problem.cost(y_new))
-        eq_after = self.problem.equality_constraints(y_new)
-        ineq_after = self.problem.inequality_constraints(y_new)
-
-        if fallback_used:
-            self.previous_trajectory = None
-            self.previous_lambda = None
-            self.previous_mu = None
-            self.previous_delta = None
-        else:
-            self.previous_trajectory = traj_new
-            self.previous_lambda = lam
-            self.previous_mu = mu
-            self.previous_delta = qp_result.delta_y.copy()
-
-        diag = RTIDiagnostics(
-            mpc_step=self.mpc_step,
-            cost_before=deriv.cost_value,
-            equality_residual_norm_before=float(np.linalg.norm(deriv.equality)),
-            inequality_violation_before=float(
-                np.min(np.minimum(deriv.inequality, 0.0))
-                if deriv.inequality.size else 0.0),
-            qp_status=qp_result.status,
-            qp_iterations=qp_result.iterations,
-            qp_objective=qp_result.objective,
-            delta_norm=float(np.linalg.norm(delta)),
-            alpha=self.alpha,
-            cost_after=cost_after,
-            equality_residual_norm_after=float(np.linalg.norm(eq_after)),
-            inequality_violation_after=float(
-                np.min(np.minimum(ineq_after, 0.0)) if ineq_after.size else 0.0),
-            applied_control=applied.copy(),
-            sqp_steps=1,
-            qp_solve_attempts=attempts,
-            fallback_used=fallback_used,
-        )
-        self.mpc_step += 1
-
-        if self.debug:
-            print(
-                f"RTI step {diag.mpc_step}: cost {diag.cost_before:.3e} -> "
-                f"{diag.cost_after:.3e}, |C|={diag.equality_residual_norm_before:.3e}, "
-                f"ineq={diag.inequality_violation_before:.3e}, "
-                f"QP={diag.qp_status}, |dy|={diag.delta_norm:.3e}"
-            )
-
-        if hasattr(self.problem, "set_previous_tau"):
-            self.problem.set_previous_tau(applied)
-
-        return applied, traj_new, diag
