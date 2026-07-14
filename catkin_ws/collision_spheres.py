@@ -310,11 +310,18 @@ def default_ur10e_collision_spheres():
 
 def obstacle_sdfs_from_environment(env, target_obstacle_name=None,
                                    target_d_safe_factor=0.5,
-                                   d_safe=0.04):
+                                   d_safe=0.04,
+                                   constrained_obstacle_names=None):
+    constrained_names = (
+        None if constrained_obstacle_names is None
+        else set(constrained_obstacle_names)
+    )
     sdfs = []
     for spec in env._obstacle_defs:
         name = spec.get("name", "")
         if spec.get("type") != "cylinder":
+            continue
+        if constrained_names is not None and name not in constrained_names:
             continue
         radius, half_height = spec["size"]
         safety_margin = float(d_safe)
@@ -340,7 +347,8 @@ def make_default_ur10e_collision_model(env, arm,
                                        d_safe=0.04,
                                        d_box=0.03,
                                        target_obstacle_name=None,
-                                       target_d_safe_factor=0.5):
+                                       target_d_safe_factor=0.5,
+                                       constrained_obstacle_names=None):
     return CollisionSphereModel(
         arm.model,
         arm.data,
@@ -351,6 +359,7 @@ def make_default_ur10e_collision_model(env, arm,
             target_obstacle_name=target_obstacle_name,
             target_d_safe_factor=target_d_safe_factor,
             d_safe=d_safe,
+            constrained_obstacle_names=constrained_obstacle_names,
         ),
         box_sdf=(box_sdf if include_box else None),
         d_ground=d_ground,

@@ -255,6 +255,7 @@ def make_solver(args, env, initial_pos, export_suffix=""):
             d_box=args.d_box,
             target_obstacle_name=target_obstacle_name,
             target_d_safe_factor=0.5,
+            constrained_obstacle_names={target_obstacle_name},
         )
     problem = ArmNMPCProblem(
         arm,
