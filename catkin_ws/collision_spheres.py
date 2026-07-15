@@ -45,55 +45,6 @@ class StaticObstacleConstraint:
     name: str = ""
 
 
-class FiniteCylinderSDF:
-    """Signed distance to the lateral surface of a finite open cylinder.
-
-    The MPC should avoid the cylinder wall, not the top/bottom disk areas.
-    Points above or below the cylinder height are measured to the closest
-    lateral rim instead of to a cap plane.
-    """
-
-    def __init__(self, center, radius, half_height):
-        self.center = np.asarray(center, dtype=np.float64)
-        self.radius = float(radius)
-        self.half_height = float(half_height)
-
-    def __call__(self, p):
-        p = np.asarray(p, dtype=np.float64)
-        radial = np.linalg.norm(p[:2] - self.center[:2]) - self.radius
-        vertical_excess = abs(float(p[2] - self.center[2])) - self.half_height
-        if vertical_excess <= 0.0:
-            return float(radial)
-        return float(np.hypot(radial, vertical_excess))
-
-    def value_and_gradient(self, p):
-        p = np.asarray(p, dtype=np.float64)
-        xy = p[:2] - self.center[:2]
-        rho = float(np.linalg.norm(xy))
-        radial = rho - self.radius
-        z_delta = float(p[2] - self.center[2])
-        vertical_excess = abs(z_delta) - self.half_height
-
-        if rho > 1e-12:
-            grad_radial = np.array([xy[0] / rho, xy[1] / rho, 0.0])
-        else:
-            grad_radial = np.array([1.0, 0.0, 0.0])
-
-        if vertical_excess <= 0.0:
-            return float(radial), grad_radial
-
-        z_sign = 1.0 if z_delta >= 0.0 else -1.0
-        grad_vertical = np.array([0.0, 0.0, z_sign])
-        norm = float(np.hypot(radial, vertical_excess))
-        if norm <= 1e-12:
-            return 0.0, grad_radial
-        gradient = (
-            radial * grad_radial +
-            vertical_excess * grad_vertical
-        ) / norm
-        return norm, gradient
-
-
 class AxisAlignedBoxSDF:
     def __init__(self, center, half_extents):
         self.center = np.asarray(center, dtype=np.float64)
@@ -310,29 +261,8 @@ def default_ur10e_collision_spheres():
 
 def obstacle_sdfs_from_environment(env, target_obstacle_name=None,
                                    target_d_safe_factor=0.5,
-                                   d_safe=0.04,
-                                   constrained_obstacle_names=None):
-    constrained_names = (
-        None if constrained_obstacle_names is None
-        else set(constrained_obstacle_names)
-    )
-    sdfs = []
-    for spec in env._obstacle_defs:
-        name = spec.get("name", "")
-        if spec.get("type") != "cylinder":
-            continue
-        if constrained_names is not None and name not in constrained_names:
-            continue
-        radius, half_height = spec["size"]
-        safety_margin = float(d_safe)
-        if name == target_obstacle_name:
-            safety_margin *= float(target_d_safe_factor)
-        sdfs.append(StaticObstacleConstraint(
-            sdf=FiniteCylinderSDF(spec["pos"], radius, half_height),
-            safety_margin=safety_margin,
-            name=name,
-        ))
-    return sdfs
+                                   d_safe=0.04):
+    return []
 
 
 def default_table_box_sdf(center=(0.35, 0.70, 0.14),
@@ -347,8 +277,7 @@ def make_default_ur10e_collision_model(env, arm,
                                        d_safe=0.04,
                                        d_box=0.03,
                                        target_obstacle_name=None,
-                                       target_d_safe_factor=0.5,
-                                       constrained_obstacle_names=None):
+                                       target_d_safe_factor=0.5):
     return CollisionSphereModel(
         arm.model,
         arm.data,
@@ -359,7 +288,6 @@ def make_default_ur10e_collision_model(env, arm,
             target_obstacle_name=target_obstacle_name,
             target_d_safe_factor=target_d_safe_factor,
             d_safe=d_safe,
-            constrained_obstacle_names=constrained_obstacle_names,
         ),
         box_sdf=(box_sdf if include_box else None),
         d_ground=d_ground,

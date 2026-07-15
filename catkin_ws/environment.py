@@ -14,25 +14,37 @@ PDDL_PROBLEM_PATH = os.path.abspath(os.path.join(
     "problem_chem_simplified_no_redundant_predicates.pddl",
 ))
 
-# Externally chosen cylinder radii, in meters. The PDDL gives x/y centers and
-# total z height; the radius is a scene-design choice.
-PDDL_CYLINDER_RADII = {
-    "in-2": 0.050,
-    "in-4": 0.055,
-    "in-5": 0.047,
-    "out-2": 0.060,
-}
-
-PDDL_CYLINDER_COLORS = {
-    "in-2":  [0.95, 0.68, 0.20, 0.85],
-    "in-4":  [0.20, 0.75, 0.90, 0.85],
-    "in-5":  [0.95, 0.45, 0.20, 0.85],
-    "out-2": [0.88, 0.88, 0.24, 0.85],
-}
-
-REMOVED_PDDL_CYLINDERS = {"in-1", "in-3", "out-1"}
-
 PDDL_LAYOUT_ROTATION_DEG = -90.0
+
+TABLE_TOP_VERTICES = {
+    "v2": (-0.426518,  1.232840, 0.002500),
+    "v4": (-0.427621, -0.152159, 0.002500),
+    "v6": ( 0.427379, -0.152840, 0.002500),
+    "v8": ( 0.428481,  1.232159, 0.002500),
+}
+TABLE_X_MIN = min(v[0] for v in TABLE_TOP_VERTICES.values())
+TABLE_X_MAX = max(v[0] for v in TABLE_TOP_VERTICES.values())
+TABLE_Y_MIN = min(v[1] for v in TABLE_TOP_VERTICES.values())
+TABLE_Y_MAX = max(v[1] for v in TABLE_TOP_VERTICES.values())
+TABLE_TOP_Z = 0.002500
+
+# Five close cubes on the table. MuJoCo box geoms use half-extents, so the
+# z-position is the cube center and the bottom face sits on TABLE_TOP_Z.
+TABLE_CUBE_SIDE = 0.050
+TABLE_CUBE_CENTERS_XY = {
+    "cube_1": (-0.070, 0.640),
+    "cube_2": ( 0.025, 0.640),
+    "cube_3": ( 0.120, 0.640),
+    "cube_4": (-0.025, 0.735),
+    "cube_5": ( 0.070, 0.735),
+}
+TABLE_CUBE_COLORS = {
+    "cube_1": [0.90, 0.20, 0.18, 1.0],
+    "cube_2": [0.16, 0.54, 0.92, 1.0],
+    "cube_3": [0.18, 0.72, 0.34, 1.0],
+    "cube_4": [0.95, 0.73, 0.20, 1.0],
+    "cube_5": [0.62, 0.34, 0.88, 1.0],
+}
 
 _PDDL_BUCKET_RE = re.compile(
     r"\(=\s+\(bucket-([xyz])\s+([^\s)]+)\)\s+"
@@ -93,39 +105,30 @@ def load_pddl_bucket_targets(problem_path=PDDL_PROBLEM_PATH,
     return targets
 
 
-def load_pddl_cylinder_obstacles(problem_path=PDDL_PROBLEM_PATH):
-    """Build static cylinder obstacles from PDDL bucket coordinates."""
+def load_table_cube_obstacles():
+    """Build the default static cube layout on the provided table surface."""
+    half_side = 0.5 * TABLE_CUBE_SIDE
+    z_center = TABLE_TOP_Z + half_side
     obstacles = []
-    bucket_coords = _read_pddl_bucket_xyz(problem_path)
-    center_x, center_y = _bucket_layout_center(bucket_coords)
 
-    for index, (name, (x, y, height)) in enumerate(bucket_coords.items()):
-        if name in REMOVED_PDDL_CYLINDERS:
-            continue
-        if height <= 0.0:
-            continue
-
-        fallback_radius = 0.040 + 0.004 * (index % 6)
-        radius = PDDL_CYLINDER_RADII.get(name, fallback_radius)
-        half_height = 0.5 * height
-        rotated_x, rotated_y = _rotate_xy(
-            x, y, center_x, center_y, PDDL_LAYOUT_ROTATION_DEG)
+    for name, (x, y) in TABLE_CUBE_CENTERS_XY.items():
+        if not (TABLE_X_MIN + half_side <= x <= TABLE_X_MAX - half_side):
+            raise ValueError(f"{name} x center leaves the table bounds")
+        if not (TABLE_Y_MIN + half_side <= y <= TABLE_Y_MAX - half_side):
+            raise ValueError(f"{name} y center leaves the table bounds")
 
         obstacles.append({
-            "name": f"pddl_{name.replace('-', '_')}_cylinder",
-            "pos": [float(rotated_x), float(rotated_y), half_height],
-            "size": [radius, half_height],
-            "rgba": PDDL_CYLINDER_COLORS.get(name, [0.9, 0.5, 0.1, 0.85]),
-            "type": "cylinder",
-            # MuJoCo cylinders have solid caps. Keep them visual-only here and
-            # let the MPC lateral-surface SDF provide the obstacle constraint.
-            "contype": 0,
-            "conaffinity": 0,
+            "name": name,
+            "pos": [float(x), float(y), float(z_center)],
+            "size": [half_side, half_side, half_side],
+            "rgba": TABLE_CUBE_COLORS.get(name, [0.8, 0.3, 0.2, 1.0]),
+            "type": "box",
         })
+
     return obstacles
 
 
-OBSTACLE_DEFAULTS = load_pddl_cylinder_obstacles()
+OBSTACLE_DEFAULTS = load_table_cube_obstacles()
 
 
 def _fmt(vec):
@@ -182,7 +185,7 @@ def _build_model(robot_xml_path, obstacles):
 # ── Environment class ──────────────────────────────────────────────────────────
 
 class environment:
-    """Wrap the robot and static PDDL cylinders used by the MPC scene."""
+    """Wrap the robot and static table-top obstacles used by the MPC scene."""
 
     def __init__(self, robot="ur10e", obstacles=None):
         from robot_config import get_config

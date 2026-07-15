@@ -11,5 +11,5 @@ if not exist "%CONDA_BAT%" (
 )
 
 cd /d "%WORKDIR%" || exit /b 1
-call "%CONDA_BAT%" run --no-capture-output -n robot_sim python -I run_pddl_plan.py
+call "%CONDA_BAT%" run --no-capture-output -n mlc-stack python -I run_pddl_plan.py
 exit /b %ERRORLEVEL%

@@ -16,7 +16,7 @@ if (-not (Test-Path -LiteralPath $conda)) {
 $env:PYTHONNOUSERSITE = "1"
 Push-Location $workdir
 try {
-    & $conda run --no-capture-output -n robot_sim python -I run_pddl_plan.py
+    & $conda run --no-capture-output -n mlc-stack python -I run_pddl_plan.py
 }
 finally {
     Pop-Location

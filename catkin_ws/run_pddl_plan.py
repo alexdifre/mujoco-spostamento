@@ -5,6 +5,7 @@ import sys
 import time
 from collections import deque
 
+import mujoco
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -16,9 +17,10 @@ from collision_spheres import (
     make_default_ur10e_collision_model,
 )
 from environment import (
-    PDDL_CYLINDER_RADII,
+    TABLE_CUBE_CENTERS_XY,
+    TABLE_CUBE_SIDE,
+    TABLE_TOP_Z,
     environment,
-    load_pddl_bucket_targets,
 )
 from rti_sqp_mpc import (
     ArmNMPCProblem,
@@ -26,7 +28,7 @@ from rti_sqp_mpc import (
 from viz import draw_polyline, draw_sphere_marker
 
 
-DEFAULT_TARGET_CYLINDER = "out-2"
+DEFAULT_TARGET_CUBE = "cube_3"
 
 TRAJ_MAX_PTS = 800
 TRAJ_SAMPLE_DT = 0.01
@@ -51,21 +53,19 @@ def resolve_acados_export_dir(path):
     ))
 
 
-def build_single_target(target_cylinder, target_clearance=0.06,
-                        rotate_layout=True):
-    if target_cylinder not in PDDL_CYLINDER_RADII:
-        options = ", ".join(sorted(PDDL_CYLINDER_RADII))
+def build_single_target(target_cube, target_clearance=0.06):
+    if target_cube not in TABLE_CUBE_CENTERS_XY:
+        options = ", ".join(sorted(TABLE_CUBE_CENTERS_XY))
         raise KeyError(
-            f"unknown visible cylinder {target_cylinder!r}; choose one of: "
+            f"unknown visible cube {target_cube!r}; choose one of: "
             f"{options}"
         )
-    targets = load_pddl_bucket_targets(
-        rotate_layout=rotate_layout,
-        z_clearance=target_clearance,
+    x, y = TABLE_CUBE_CENTERS_XY[target_cube]
+    target = np.array(
+        [float(x), float(y), TABLE_TOP_Z + TABLE_CUBE_SIDE + target_clearance],
+        dtype=np.float64,
     )
-    if target_cylinder not in targets:
-        raise KeyError(f"missing PDDL target for {target_cylinder!r}")
-    return targets[target_cylinder], f"above {target_cylinder} center"
+    return target, f"above {target_cube} center"
 
 
 def parabolic_arc_height(p0, p_goal):
@@ -227,11 +227,17 @@ def terminal_upright_error(robot):
     return float(np.linalg.norm(robot.ee_rot[:2, 2]))
 
 
+def end_effector_linear_velocity(robot):
+    """Return the world-frame linear velocity of the TCP body."""
+    jacobian = np.zeros((3, robot.model.nv), dtype=np.float64)
+    mujoco.mj_jacBody(
+        robot.model, robot.data, jacobian, None, robot._ee_id
+    )
+    return jacobian @ robot.data.qvel
+
+
 def phase_acados_export_dir(args, export_suffix=""):
-    if export_suffix == "vertical":
-        directory = args.acados_insert_export_dir
-    else:
-        directory = args.acados_above_export_dir
+    directory = args.acados_export_dir
     if not args.collision_constraints:
         directory = f"{directory}_free"
     return resolve_acados_export_dir(directory)
@@ -244,7 +250,6 @@ def make_solver(args, env, initial_pos, export_suffix=""):
     collision_model = None
     if args.collision_constraints:
         box_sdf = default_table_box_sdf() if args.include_box else None
-        target_obstacle_name = f"pddl_{args.target_cylinder.replace('-', '_')}_cylinder"
         collision_model = make_default_ur10e_collision_model(
             env,
             arm,
@@ -253,7 +258,7 @@ def make_solver(args, env, initial_pos, export_suffix=""):
             d_ground=args.d_ground,
             d_safe=args.d_safe,
             d_box=args.d_box,
-            target_obstacle_name=target_obstacle_name,
+            target_obstacle_name=None,
             target_d_safe_factor=0.5,
             constrained_obstacle_names={target_obstacle_name},
         )
@@ -310,15 +315,31 @@ def make_solver(args, env, initial_pos, export_suffix=""):
     return arm, problem, solver
 
 
-def run_with_env(args, env, viewer=None):
-    env.reset()
+def run_with_env(
+    args,
+    env,
+    viewer=None,
+    *,
+    target=None,
+    target_label=None,
+    reset=True,
+    solver_bundle=None,
+):
+    """Move to one target, optionally reusing a live robot and NMPC solver."""
+    if reset:
+        env.reset()
     robot = env.robot
-    target, target_label = build_single_target(
-        target_cylinder=args.target_cylinder,
-        target_clearance=args.target_clearance,
-        rotate_layout=not args.raw_pddl_targets,
-    )
-    approach_target = target.copy()
+    if target is None:
+        target, default_label = build_single_target(
+            target_cube=args.target_cube,
+            target_clearance=args.target_clearance,
+        )
+        if target_label is None:
+            target_label = default_label
+    else:
+        target = np.asarray(target, dtype=np.float64).reshape(3)
+        if target_label is None:
+            target_label = "custom Cartesian target"
     initial_ee_pos = robot.ee_pos.copy()
     waypoint_path = build_parabolic_waypoints(
         initial_ee_pos,
@@ -333,13 +354,28 @@ def run_with_env(args, env, viewer=None):
     path_progress = 0.0
     arc_height = parabolic_arc_height(initial_ee_pos, target)
 
-    arm, problem, solver = make_solver(
-        args,
-        env,
-        initial_ee_pos,
-    )
+    if solver_bundle is None:
+        arm, problem, solver = make_solver(
+            args,
+            env,
+            initial_ee_pos,
+        )
+    else:
+        arm, problem, solver = solver_bundle
+        # A new Cartesian target is a new OCP episode.  Keep the compiled
+        # solver, but do not shift the previous target's RTI trajectory.
+        solver.previous_trajectory = None
 
     dt = robot.model.opt.timestep
+    ee_speed_tolerance = float(getattr(args, "ee_reach_speed_tol", 0.05))
+    joint_speed_tolerance = float(
+        getattr(args, "joint_reach_speed_tol", 0.15)
+    )
+    goal_settle_time = float(getattr(args, "goal_settle_time", 0.10))
+    if ee_speed_tolerance < 0.0 or joint_speed_tolerance < 0.0 or goal_settle_time < 0.0:
+        raise ValueError("terminal speed tolerances and settle time must be non-negative")
+    required_settle_steps = max(int(np.ceil(goal_settle_time / dt)), 1)
+    settled_steps = 0
     mpc_every = max(int(round(args.mpc_dt / dt)), 1)
     draw_every = max(int(round(TRAJ_SAMPLE_DT / dt)), 1)
 
@@ -353,10 +389,6 @@ def run_with_env(args, env, viewer=None):
     max_ineq_violation = 0.0
     previous_ee_err = float(np.linalg.norm(robot.ee_pos - target))
     target_settle_active = False
-    phase = "approach"
-    approach_hold_count = 0
-    bottom_hold_count = 0
-    return_hold_count = 0
     real_time_wall_start = time.perf_counter()
     real_time_sim_start = float(robot.data.time)
     print(f"target: {target_label} {np.round(target, 4).tolist()}")
@@ -375,108 +407,33 @@ def run_with_env(args, env, viewer=None):
 
         ee_err = float(np.linalg.norm(robot.ee_pos - target))
         upright_err = terminal_upright_error(robot)
-        active_reach_tol = (
-            args.vertical_reach_tol
-            if phase in {"descend", "ascend"}
-            else args.reach_tol
-        )
+        ee_velocity = end_effector_linear_velocity(robot)
+        ee_speed = float(np.linalg.norm(ee_velocity))
+        joint_speed = float(np.linalg.norm(arm.get_state()[arm.n:]))
         if ee_err <= args.goal_hold_radius:
             target_settle_active = True
-        if ee_err <= active_reach_tol and upright_err <= args.upright_reach_tol:
-            if phase == "approach":
-                if (not args.enable_cylinder_insertion
-                        or approach_hold_count >= args.approach_hold_steps):
-                    print(
-                        f"reached {target_label} err={ee_err:.4f} m, "
-                        f"upright_err={upright_err:.4f}"
-                    )
-                    if not args.enable_cylinder_insertion:
-                        print(f"done in {step} sim steps")
-                        return 0
-
-                    target = approach_target.copy()
-                    target[2] -= args.target_clearance + args.cylinder_entry_depth
-                    target_label = (
-                        f"inside {args.target_cylinder} "
-                        f"{args.cylinder_entry_depth:.3f} m below top"
-                    )
-                    waypoint_path = build_linear_waypoints(
-                        robot.ee_pos.copy(),
-                        target,
-                        num_waypoints=args.vertical_num_waypoints,
-                    )
-                    waypoint_s = waypoint_arclengths(waypoint_path)
-                    waypoint_index = 0
-                    closest_waypoint_index = 0
-                    distance_to_path = 0.0
-                    path_progress = 0.0
-                    arc_height = 0.0
-                    target_settle_active = False
-                    previous_ee_err = float(np.linalg.norm(robot.ee_pos - target))
-                    target_marker_position = target.copy()
-                    arm, problem, solver = make_solver(
-                        args,
-                        env,
-                        robot.ee_pos.copy(),
-                        export_suffix="vertical",
-                    )
-                    problem.set_previous_tau(current_tau)
-                    phase = "descend"
-                    print(
-                        f"starting vertical insertion target "
-                        f"{np.round(target, 4).tolist()}"
-                    )
-                    continue
-                approach_hold_count += 1
-                target_settle_active = True
-            elif phase == "descend":
-                if bottom_hold_count >= args.vertical_hold_steps:
-                    print(
-                        f"inserted {target_label} err={ee_err:.4f} m, "
-                        f"upright_err={upright_err:.4f}"
-                    )
-                    target = approach_target.copy()
-                    target_label = f"return above {args.target_cylinder}"
-                    waypoint_path = build_linear_waypoints(
-                        robot.ee_pos.copy(),
-                        target,
-                        num_waypoints=args.vertical_num_waypoints,
-                    )
-                    waypoint_s = waypoint_arclengths(waypoint_path)
-                    waypoint_index = 0
-                    closest_waypoint_index = 0
-                    distance_to_path = 0.0
-                    path_progress = 0.0
-                    arc_height = 0.0
-                    target_settle_active = False
-                    previous_ee_err = float(np.linalg.norm(robot.ee_pos - target))
-                    target_marker_position = target.copy()
-                    problem.set_previous_tau(current_tau)
-                    phase = "ascend"
-                    print(
-                        f"starting vertical return target "
-                        f"{np.round(target, 4).tolist()}"
-                    )
-                    continue
-                bottom_hold_count += 1
-                target_settle_active = True
-            elif phase == "ascend":
-                if return_hold_count >= args.vertical_return_hold_steps:
-                    print(
-                        f"returned {target_label} err={ee_err:.4f} m, "
-                        f"upright_err={upright_err:.4f}"
-                    )
-                    print(f"done in {step} sim steps")
-                    return 0
-                return_hold_count += 1
-                target_settle_active = True
+        terminal_state_valid = (
+            ee_err <= args.reach_tol
+            and upright_err <= args.upright_reach_tol
+            and ee_speed <= ee_speed_tolerance
+            and joint_speed <= joint_speed_tolerance
+        )
+        settled_steps = settled_steps + 1 if terminal_state_valid else 0
+        if settled_steps >= required_settle_steps:
+            print(
+                f"reached {target_label} err={ee_err:.4f} m, "
+                f"upright_err={upright_err:.4f}, "
+                f"ee_speed={ee_speed:.4f} m/s, "
+                f"joint_speed={joint_speed:.4f} rad/s"
+            )
+            print(
+                f"done in {step} sim steps "
+                f"after {settled_steps * dt:.3f} s settled"
+            )
+            return 0
 
         if step % mpc_every == 0:
-            active_ref_speed = (
-                args.vertical_ref_speed
-                if phase in {"descend", "ascend"}
-                else args.ref_speed
-            )
+            active_ref_speed = args.ref_speed
             problem.set_box_active_mask(
                 np.ones(args.horizon + 1, dtype=bool))
             problem.set_box_contact_allowed_mask(
@@ -546,6 +503,8 @@ def run_with_env(args, env, viewer=None):
                     f"distance_to_current_waypoint={dist_to_wp:.4f}, "
                     f"distance_to_target={ee_err:.4f}, "
                     f"upright_error={upright_err:.4f}, "
+                    f"ee_speed={ee_speed:.4f}, "
+                    f"joint_speed={joint_speed:.4f}, "
                     f"p_ref_0={np.round(refs[0], 4).tolist()}, "
                     f"p_ref_N={np.round(refs[-1], 4).tolist()}, "
                     f"arc_height={arc_height:.4f}"
@@ -567,11 +526,7 @@ def run_with_env(args, env, viewer=None):
         if post_step_err <= args.goal_hold_radius:
             progress_speed = 0.0
         else:
-            progress_speed = (
-                args.vertical_ref_speed
-                if phase in {"descend", "ascend"}
-                else args.ref_speed
-            )
+            progress_speed = args.ref_speed
         if post_step_err > previous_ee_err + args.progress_error_slack:
             progress_speed = 0.0
         previous_ee_err = post_step_err
@@ -623,10 +578,16 @@ def run_with_env(args, env, viewer=None):
 
     final_err = float(np.linalg.norm(robot.ee_pos - target))
     final_upright_err = terminal_upright_error(robot)
+    final_ee_speed = float(
+        np.linalg.norm(end_effector_linear_velocity(robot))
+    )
+    final_joint_speed = float(np.linalg.norm(arm.get_state()[arm.n:]))
     print(
         f"not finished, target={target_label!r}, "
         f"final_err={final_err:.4f} m, "
-        f"final_upright_err={final_upright_err:.4f}"
+        f"final_upright_err={final_upright_err:.4f}, "
+        f"final_ee_speed={final_ee_speed:.4f} m/s, "
+        f"final_joint_speed={final_joint_speed:.4f} rad/s"
     )
     print(f"max inequality violation: {max_ineq_violation:.4f}")
     return 1
@@ -652,42 +613,25 @@ def parse_args(argv=None):
         description="Move the UR10e end effector to one visible scene target with RTI NMPC."
     )
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--target-cylinder",
-                        choices=sorted(PDDL_CYLINDER_RADII),
-                        default=DEFAULT_TARGET_CYLINDER)
+    parser.add_argument("--target-cube",
+                        choices=sorted(TABLE_CUBE_CENTERS_XY),
+                        default=DEFAULT_TARGET_CUBE)
     parser.add_argument("--target-clearance", type=float, default=0.10,
-                        help="meters above the cylinder top center")
-    parser.add_argument("--reach-tol", type=float, default=0.01)
+                        help="meters above the cube top center")
+    parser.add_argument("--reach-tol", type=float, default=0.10)
     parser.add_argument("--upright-reach-tol", type=float, default=0.25,
                         help="maximum terminal TCP vertical-axis error")
+    parser.add_argument("--ee-reach-speed-tol", type=float, default=0.05,
+                        help="maximum TCP speed at successful termination in m/s")
+    parser.add_argument("--joint-reach-speed-tol", type=float, default=0.15,
+                        help="maximum arm joint-speed norm at successful termination in rad/s")
+    parser.add_argument("--goal-settle-time", type=float, default=0.10,
+                        help="continuous time all terminal tolerances must hold")
     parser.add_argument("--max-steps", type=int, default=50000)
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--mpc-dt", type=float, default=0.04)
     parser.add_argument("--ref-speed", type=float, default=0.18,
                         help="meters per second along the fixed Cartesian arc")
-    parser.add_argument("--enable-cylinder-insertion",
-                        dest="enable_cylinder_insertion",
-                        action="store_true",
-                        default=True,
-                        help="after reaching the first target, descend into the cylinder and return")
-    parser.add_argument("--no-cylinder-insertion",
-                        dest="enable_cylinder_insertion",
-                        action="store_false",
-                        help="stop after the first target as in the original PDDL playback")
-    parser.add_argument("--cylinder-entry-depth", type=float, default=0.04,
-                        help="meters below the target cylinder top for the vertical insertion")
-    parser.add_argument("--vertical-ref-speed", type=float, default=0.08,
-                        help="meters per second for the insertion and return MPC")
-    parser.add_argument("--vertical-reach-tol", type=float, default=0.015,
-                        help="position tolerance for insertion and return phases")
-    parser.add_argument("--approach-hold-steps", type=int, default=120,
-                        help="simulation steps to hold above the cylinder before descending")
-    parser.add_argument("--vertical-hold-steps", type=int, default=180,
-                        help="simulation steps to hold inside the cylinder before returning")
-    parser.add_argument("--vertical-return-hold-steps", type=int, default=120,
-                        help="simulation steps to hold after returning above the cylinder")
-    parser.add_argument("--vertical-num-waypoints", type=int, default=24,
-                        help="linear waypoint count for vertical insertion and return")
     parser.add_argument("--num-waypoints", type=int, default=80)
     parser.add_argument("--waypoint-tracking-tol", type=float, default=0.025)
     parser.add_argument("--max-path-lead", type=float, default=0.10,
@@ -709,8 +653,8 @@ def parse_args(argv=None):
     parser.add_argument("--ee-terminal-upright-weight", type=float,
                         default=1200.0)
     parser.add_argument("--qv-weight", type=float, default=0.08)
-    parser.add_argument("--q-weight", type=float, default=0.0)
-    parser.add_argument("--qf-weight", type=float, default=0.0)
+    parser.add_argument("--q-weight", type=float, default=1.0)
+    parser.add_argument("--qf-weight", type=float, default=5.0)
     parser.add_argument("--qvf-weight", type=float, default=0.10)
     parser.add_argument("--ee-velocity-weight", type=float, default=2.0)
     parser.add_argument("--delta-tau-cost", type=float, default=0.02)
@@ -732,12 +676,9 @@ def parse_args(argv=None):
                         action="store_false",
                         help="disable collision/ground constraints for smoother playback")
     parser.add_argument("--regularization", type=float, default=1e-5)
-    parser.add_argument("--acados-above-export-dir",
-                        default=default_acados_export_dir("ur10e_above"),
-                        help="prebuilt acados solver directory for the above/approach phase")
-    parser.add_argument("--acados-insert-export-dir",
-                        default=default_acados_export_dir("ur10e_insert"),
-                        help="prebuilt acados solver directory for the vertical insert/return phase")
+    parser.add_argument("--acados-export-dir",
+                        default=default_acados_export_dir("ur10e_cubes"),
+                        help="prebuilt acados solver directory")
     parser.add_argument("--acados-qp-solver", default="FULL_CONDENSING_DAQP",
                         help="acados QP solver")
     parser.add_argument("--acados-qp-solver-iter-max", type=int, default=200,
@@ -767,8 +708,6 @@ def parse_args(argv=None):
     parser.add_argument("--real-time-factor", type=float, default=1.0,
                         help="viewer playback speed multiplier")
     parser.add_argument("--wrap-joints", action="store_true")
-    parser.add_argument("--raw-pddl-targets", action="store_true",
-                        help="use raw PDDL x/y target instead of the rotated scene frame")
     parser.add_argument("--trace-width", type=float, default=0.0025,
                         help="width of the drawn end-effector trajectory line")
     parser.add_argument("--target-marker-radius", type=float, default=0.007,
